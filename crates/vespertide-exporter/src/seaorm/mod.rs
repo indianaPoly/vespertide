@@ -604,15 +604,11 @@ fn infer_field_name_from_fk_column(fk_column: &str, table_name: &str, to: &str) 
     // Remove the "to" suffix from FK column (e.g., "user_id" for to="id", "user_idx" for to="idx").
     // If FK column still uses common suffixes like "*_id"/"*_idx", strip them as fallbacks.
     let to_suffix = format!("_{to}");
-    let without_suffix = if fk_column.ends_with(&to_suffix) {
-        &fk_column[..fk_column.len() - to_suffix.len()]
-    } else if fk_column.ends_with("_id") {
-        &fk_column[..fk_column.len() - 3]
-    } else if fk_column.ends_with("_idx") {
-        &fk_column[..fk_column.len() - 4]
-    } else {
-        fk_column
-    };
+    let without_suffix = fk_column
+        .strip_suffix(&to_suffix)
+        .or_else(|| fk_column.strip_suffix("_id"))
+        .or_else(|| fk_column.strip_suffix("_idx"))
+        .unwrap_or(fk_column);
 
     let sanitized = sanitize_field_name(without_suffix);
     let sanitized_lower = sanitized.to_lowercase();
