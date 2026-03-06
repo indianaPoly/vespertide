@@ -526,6 +526,42 @@ fn rewrite_plan_for_recreation(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecreateHandling {
+    NotNeeded,
+    Rewritten,
+    PlanEmptied,
+}
+
+fn handle_recreate_requirements<F>(
+    plan: &mut MigrationPlan,
+    current_models: &[TableDef],
+    prompt_fn: F,
+) -> Result<RecreateHandling>
+where
+    F: Fn(&[RecreateTableRequired]) -> Result<bool>,
+{
+    let recreate_tables = find_non_nullable_fk_add_columns(plan, current_models);
+    if recreate_tables.is_empty() {
+        return Ok(RecreateHandling::NotNeeded);
+    }
+
+    if !prompt_fn(&recreate_tables)? {
+        anyhow::bail!(
+            "Migration cancelled. To proceed without recreation, make the column nullable \
+             or add it with a default value that references an existing row."
+        );
+    }
+
+    rewrite_plan_for_recreation(plan, &recreate_tables, current_models);
+
+    if plan.actions.is_empty() {
+        return Ok(RecreateHandling::PlanEmptied);
+    }
+
+    Ok(RecreateHandling::Rewritten)
+}
+
 pub async fn cmd_revision(message: String, fill_with_args: Vec<String>) -> Result<()> {
     let config = load_config()?;
     let current_models = load_models(&config)?;
@@ -543,20 +579,10 @@ pub async fn cmd_revision(message: String, fill_with_args: Vec<String>) -> Resul
         return Ok(());
     }
 
-    // Check for non-nullable FK columns being added to existing tables.
-    // These require table recreation because existing rows can't satisfy the FK constraint.
-    let recreate_tables = find_non_nullable_fk_add_columns(&plan, &current_models);
-    if !recreate_tables.is_empty() {
-        if !prompt_recreate_tables(&recreate_tables)? {
-            anyhow::bail!(
-                "Migration cancelled. To proceed without recreation, make the column nullable \
-                 or add it with a default value that references an existing row."
-            );
-        }
-        rewrite_plan_for_recreation(&mut plan, &recreate_tables, &current_models);
-
-        // Re-check: if plan is now empty after recreation rewrite, nothing to do
-        if plan.actions.is_empty() {
+    // Check for non-nullable FK changes that require table recreation.
+    match handle_recreate_requirements(&mut plan, &current_models, prompt_recreate_tables)? {
+        RecreateHandling::NotNeeded | RecreateHandling::Rewritten => {}
+        RecreateHandling::PlanEmptied => {
             println!(
                 "{} {}",
                 "No changes detected.".bright_yellow(),
@@ -1096,6 +1122,181 @@ mod tests {
         assert!(
             matches!(&plan.actions[1], MigrationAction::CreateTable { table, .. } if table == "post")
         );
+    }
+
+    #[test]
+    fn rewrite_plan_keeps_non_table_actions() {
+        use vespertide_core::{ColumnDef, ColumnType, SimpleColumnType};
+
+        let mut plan = MigrationPlan {
+            id: String::new(),
+            comment: None,
+            created_at: None,
+            version: 2,
+            actions: vec![
+                MigrationAction::RawSql {
+                    sql: "select 1".into(),
+                },
+                MigrationAction::AddColumn {
+                    table: "post".into(),
+                    column: Box::new(ColumnDef {
+                        name: "user_id".into(),
+                        r#type: ColumnType::Simple(SimpleColumnType::Uuid),
+                        nullable: false,
+                        default: None,
+                        comment: None,
+                        primary_key: None,
+                        unique: None,
+                        index: None,
+                        foreign_key: None,
+                    }),
+                    fill_with: None,
+                },
+            ],
+        };
+
+        let recreate = vec![RecreateTableRequired {
+            table: "post".into(),
+            column: "user_id".into(),
+            reason: RecreateReason::AddColumnWithFk,
+        }];
+
+        let models = vec![TableDef {
+            name: "post".into(),
+            description: None,
+            columns: vec![ColumnDef {
+                name: "user_id".into(),
+                r#type: ColumnType::Simple(SimpleColumnType::Uuid),
+                nullable: false,
+                default: None,
+                comment: None,
+                primary_key: None,
+                unique: None,
+                index: None,
+                foreign_key: None,
+            }],
+            constraints: vec![],
+        }];
+
+        rewrite_plan_for_recreation(&mut plan, &recreate, &models);
+
+        assert!(matches!(&plan.actions[0], MigrationAction::RawSql { sql } if sql == "select 1"));
+        assert!(
+            matches!(&plan.actions[1], MigrationAction::DeleteTable { table } if table == "post")
+        );
+        assert!(
+            matches!(&plan.actions[2], MigrationAction::CreateTable { table, .. } if table == "post")
+        );
+    }
+
+    #[test]
+    fn handle_recreate_requirements_returns_not_needed() {
+        let mut plan = MigrationPlan {
+            id: String::new(),
+            comment: None,
+            created_at: None,
+            version: 1,
+            actions: vec![MigrationAction::RawSql {
+                sql: "select 1".into(),
+            }],
+        };
+
+        let result = handle_recreate_requirements(&mut plan, &[], |_| Ok(true)).unwrap();
+
+        assert_eq!(result, RecreateHandling::NotNeeded);
+        assert_eq!(plan.actions.len(), 1);
+    }
+
+    #[test]
+    fn handle_recreate_requirements_bails_when_prompt_rejected() {
+        use vespertide_core::{ColumnDef, ColumnType, SimpleColumnType};
+
+        let mut plan = MigrationPlan {
+            id: String::new(),
+            comment: None,
+            created_at: None,
+            version: 1,
+            actions: vec![
+                MigrationAction::AddColumn {
+                    table: "post".into(),
+                    column: Box::new(ColumnDef {
+                        name: "user_id".into(),
+                        r#type: ColumnType::Simple(SimpleColumnType::Uuid),
+                        nullable: false,
+                        default: None,
+                        comment: None,
+                        primary_key: None,
+                        unique: None,
+                        index: None,
+                        foreign_key: None,
+                    }),
+                    fill_with: None,
+                },
+                MigrationAction::AddConstraint {
+                    table: "post".into(),
+                    constraint: TableConstraint::ForeignKey {
+                        name: None,
+                        columns: vec!["user_id".into()],
+                        ref_table: "user".into(),
+                        ref_columns: vec!["id".into()],
+                        on_delete: None,
+                        on_update: None,
+                    },
+                },
+            ],
+        };
+
+        let err = handle_recreate_requirements(&mut plan, &[], |_| Ok(false)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Migration cancelled. To proceed without recreation")
+        );
+    }
+
+    #[test]
+    fn handle_recreate_requirements_returns_plan_emptied_when_model_missing() {
+        use vespertide_core::{ColumnDef, ColumnType, SimpleColumnType};
+
+        let mut plan = MigrationPlan {
+            id: String::new(),
+            comment: None,
+            created_at: None,
+            version: 1,
+            actions: vec![
+                MigrationAction::AddColumn {
+                    table: "post".into(),
+                    column: Box::new(ColumnDef {
+                        name: "user_id".into(),
+                        r#type: ColumnType::Simple(SimpleColumnType::Uuid),
+                        nullable: false,
+                        default: None,
+                        comment: None,
+                        primary_key: None,
+                        unique: None,
+                        index: None,
+                        foreign_key: None,
+                    }),
+                    fill_with: None,
+                },
+                MigrationAction::AddConstraint {
+                    table: "post".into(),
+                    constraint: TableConstraint::ForeignKey {
+                        name: None,
+                        columns: vec!["user_id".into()],
+                        ref_table: "user".into(),
+                        ref_columns: vec!["id".into()],
+                        on_delete: None,
+                        on_update: None,
+                    },
+                },
+            ],
+        };
+
+        let result = handle_recreate_requirements(&mut plan, &[], |_| Ok(true)).unwrap();
+
+        assert_eq!(result, RecreateHandling::PlanEmptied);
+        assert!(plan.actions.is_empty());
     }
 
     #[test]
