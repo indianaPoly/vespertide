@@ -875,8 +875,8 @@ mod tests {
 
     #[test]
     fn find_non_nullable_inline_fk_add_column_detects_recreate() {
-        use vespertide_core::{ColumnDef, ColumnType, ReferenceAction, SimpleColumnType};
         use vespertide_core::schema::foreign_key::{ForeignKeyDef, ForeignKeySyntax};
+        use vespertide_core::{ColumnDef, ColumnType, ReferenceAction, SimpleColumnType};
 
         let plan = MigrationPlan {
             id: String::new(),
