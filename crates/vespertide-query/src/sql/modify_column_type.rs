@@ -193,14 +193,7 @@ pub fn build_modify_column_type(
                 }
 
                 // 3. ALTER TABLE ... ALTER COLUMN ... TYPE target_type USING col::text::target_type
-                queries.push(BuiltQuery::Raw(super::types::RawSql::per_backend(
-                    format!(
-                        "ALTER TABLE \"{}\" ALTER COLUMN \"{}\" TYPE \"{}\" USING \"{}\"::text::\"{}\"",
-                        table, column, target_type_name, column, target_type_name
-                    ),
-                    String::new(),
-                    String::new(),
-                )));
+                queries.push(BuiltQuery::Raw(super::types::RawSql::per_backend(format!("ALTER TABLE \"{}\" ALTER COLUMN \"{}\" TYPE \"{}\" USING \"{}\"::text::\"{}\"", table, column, target_type_name, column, target_type_name), String::new(), String::new())));
 
                 // 4. DROP old enum type
                 queries.push(BuiltQuery::Raw(super::types::RawSql::per_backend(
