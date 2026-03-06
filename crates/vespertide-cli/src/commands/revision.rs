@@ -417,21 +417,17 @@ fn find_non_nullable_fk_add_columns(
                 if let Some(model) = current_models
                     .iter()
                     .find(|m| m.name.as_str() == table.as_str())
-                {
-                    if let Some(col_def) = model
+                    && let Some(col_def) = model
                         .columns
                         .iter()
                         .find(|c| c.name.as_str() == col_name.as_str())
-                    {
-                        if !col_def.nullable && col_def.default.is_none() {
+                        && !col_def.nullable && col_def.default.is_none() {
                             result.push(RecreateTableRequired {
                                 table: table.clone(),
                                 column: col_name.clone(),
                                 reason: RecreateReason::AddFkToExistingColumn,
                             });
                         }
-                    }
-                }
             }
         }
     }
@@ -507,7 +503,7 @@ fn rewrite_plan_for_recreation(
             | MigrationAction::RemoveConstraint { table, .. } => Some(table.as_str()),
             _ => None,
         };
-        table.map_or(true, |t| !tables_to_recreate.contains(t))
+        table.is_none_or(|t| !tables_to_recreate.contains(t))
     });
 
     // Add DeleteTable + CreateTable for each recreated table
@@ -1092,8 +1088,12 @@ mod tests {
         rewrite_plan_for_recreation(&mut plan, &recreate, &models);
 
         assert_eq!(plan.actions.len(), 2);
-        assert!(matches!(&plan.actions[0], MigrationAction::DeleteTable { table } if table == "post"));
-        assert!(matches!(&plan.actions[1], MigrationAction::CreateTable { table, .. } if table == "post"));
+        assert!(
+            matches!(&plan.actions[0], MigrationAction::DeleteTable { table } if table == "post")
+        );
+        assert!(
+            matches!(&plan.actions[1], MigrationAction::CreateTable { table, .. } if table == "post")
+        );
     }
 
     #[test]
