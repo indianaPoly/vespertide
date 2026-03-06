@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use colored::Colorize;
-use dialoguer::{Input, Select};
+use dialoguer::{Confirm, Input, Select};
 use serde_json::Value;
 use tokio::fs;
 use vespertide_config::FileFormat;
@@ -330,9 +330,36 @@ where
     Ok(())
 }
 
-/// Check that no AddColumn action adds a non-nullable FK column without a default.
-/// This is logically impossible: existing rows can't satisfy the FK constraint.
-fn check_non_nullable_fk_add_columns(plan: &MigrationPlan) -> Result<()> {
+/// Reason why a table needs to be recreated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecreateReason {
+    /// A new non-nullable FK column is being added.
+    AddColumnWithFk,
+    /// A FK constraint is being added to an existing non-nullable column.
+    AddFkToExistingColumn,
+}
+
+/// A table that needs to be recreated because of a non-nullable FK constraint issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecreateTableRequired {
+    table: String,
+    column: String,
+    reason: RecreateReason,
+}
+
+/// Find actions that require table recreation due to non-nullable FK constraints.
+///
+/// Two cases are detected:
+/// 1. **AddColumn with FK**: A new non-nullable FK column is being added (no default).
+/// 2. **AddConstraint(FK) on existing column**: A FK constraint is being added to an
+///    existing non-nullable column without a default.
+///
+/// In both cases, existing rows cannot satisfy the foreign key constraint,
+/// so the table must be recreated (DeleteTable + CreateTable).
+fn find_non_nullable_fk_add_columns(
+    plan: &MigrationPlan,
+    current_models: &[TableDef],
+) -> Vec<RecreateTableRequired> {
     use std::collections::HashSet;
 
     // Collect FK columns from AddConstraint actions
@@ -349,22 +376,156 @@ fn check_non_nullable_fk_add_columns(plan: &MigrationPlan) -> Result<()> {
         }
     }
 
+    // Collect columns being added in this migration (to distinguish new vs existing)
+    let mut added_columns: HashSet<(String, String)> = HashSet::new();
+    for action in &plan.actions {
+        if let MigrationAction::AddColumn { table, column, .. } = action {
+            added_columns.insert((table.clone(), column.name.clone()));
+        }
+    }
+
+    let mut result = Vec::new();
+
+    // Case 1: AddColumn with FK (new non-nullable FK column)
     for action in &plan.actions {
         if let MigrationAction::AddColumn { table, column, .. } = action {
             let has_fk = column.foreign_key.is_some()
                 || fk_columns.contains(&(table.clone(), column.name.to_string()));
             if has_fk && !column.nullable && column.default.is_none() {
-                anyhow::bail!(
-                    "Cannot add non-nullable foreign key column '{}' to existing table '{}': \
-                     existing rows cannot satisfy the foreign key constraint. \
-                     Make the column nullable, or add it with a default value that references an existing row.",
-                    column.name,
-                    table
-                );
+                result.push(RecreateTableRequired {
+                    table: table.clone(),
+                    column: column.name.clone(),
+                    reason: RecreateReason::AddColumnWithFk,
+                });
             }
         }
     }
-    Ok(())
+
+    // Case 2: AddConstraint(FK) on existing non-nullable column
+    for action in &plan.actions {
+        if let MigrationAction::AddConstraint {
+            table,
+            constraint: TableConstraint::ForeignKey { columns, .. },
+        } = action
+        {
+            for col_name in columns {
+                // Skip if this column is being added in this migration (handled by Case 1)
+                if added_columns.contains(&(table.clone(), col_name.to_string())) {
+                    continue;
+                }
+                // Look up column in current models to check nullability
+                if let Some(model) = current_models
+                    .iter()
+                    .find(|m| m.name.as_str() == table.as_str())
+                {
+                    if let Some(col_def) = model
+                        .columns
+                        .iter()
+                        .find(|c| c.name.as_str() == col_name.as_str())
+                    {
+                        if !col_def.nullable && col_def.default.is_none() {
+                            result.push(RecreateTableRequired {
+                                table: table.clone(),
+                                column: col_name.clone(),
+                                reason: RecreateReason::AddFkToExistingColumn,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Prompt the user to confirm table recreation.
+/// Returns true if the user confirms, false otherwise.
+#[cfg(not(tarpaulin_include))]
+fn prompt_recreate_tables(tables: &[RecreateTableRequired]) -> Result<bool> {
+    println!(
+        "\n{} {}",
+        "\u{26a0}".bright_yellow(),
+        "The following tables need to be RECREATED:".bright_yellow()
+    );
+    println!("{}", "\u{2500}".repeat(60).bright_black());
+
+    for item in tables {
+        let reason_msg = match item.reason {
+            RecreateReason::AddColumnWithFk => "adding required FK column",
+            RecreateReason::AddFkToExistingColumn => "adding FK to existing required column",
+        };
+        println!(
+            "  {} Table {} \u{2014} {} {}",
+            "\u{2022}".bright_cyan(),
+            item.table.bright_white(),
+            reason_msg,
+            item.column.bright_green()
+        );
+    }
+
+    println!("{}", "\u{2500}".repeat(60).bright_black());
+    println!(
+        "  {} {}",
+        "\u{26a0}".bright_red(),
+        "ALL DATA in these tables will be DELETED.".bright_red()
+    );
+
+    let confirmed = Confirm::new()
+        .with_prompt("  Proceed with table recreation?")
+        .default(false)
+        .interact()
+        .context("failed to read confirmation")?;
+
+    Ok(confirmed)
+}
+
+/// Rewrite the migration plan to recreate tables instead of adding columns.
+/// Removes all column/constraint actions targeting the recreated tables and replaces
+/// them with DeleteTable + CreateTable using the full target model.
+fn rewrite_plan_for_recreation(
+    plan: &mut MigrationPlan,
+    recreate_tables: &[RecreateTableRequired],
+    current_models: &[TableDef],
+) {
+    use std::collections::HashSet;
+
+    let tables_to_recreate: HashSet<&str> =
+        recreate_tables.iter().map(|r| r.table.as_str()).collect();
+
+    // Remove all column/constraint actions targeting recreated tables
+    plan.actions.retain(|action| {
+        let table = match action {
+            MigrationAction::AddColumn { table, .. }
+            | MigrationAction::DeleteColumn { table, .. }
+            | MigrationAction::RenameColumn { table, .. }
+            | MigrationAction::ModifyColumnType { table, .. }
+            | MigrationAction::ModifyColumnNullable { table, .. }
+            | MigrationAction::ModifyColumnDefault { table, .. }
+            | MigrationAction::ModifyColumnComment { table, .. }
+            | MigrationAction::AddConstraint { table, .. }
+            | MigrationAction::RemoveConstraint { table, .. } => Some(table.as_str()),
+            _ => None,
+        };
+        table.map_or(true, |t| !tables_to_recreate.contains(t))
+    });
+
+    // Add DeleteTable + CreateTable for each recreated table
+    for table_name in &tables_to_recreate {
+        if let Some(model) = current_models
+            .iter()
+            .find(|m| m.name.as_str() == *table_name)
+        {
+            plan.actions.push(MigrationAction::DeleteTable {
+                table: table_name.to_string(),
+            });
+            plan.actions.push(MigrationAction::CreateTable {
+                table: model.name.clone(),
+                columns: model.columns.clone(),
+                constraints: model.constraints.clone(),
+            });
+        }
+    }
 }
 
 pub async fn cmd_revision(message: String, fill_with_args: Vec<String>) -> Result<()> {
@@ -384,9 +545,28 @@ pub async fn cmd_revision(message: String, fill_with_args: Vec<String>) -> Resul
         return Ok(());
     }
 
-    // Fail early: non-nullable FK column cannot be added to an existing table.
-    // Even with fill_with, there's no way to guarantee the value references a valid row.
-    check_non_nullable_fk_add_columns(&plan)?;
+    // Check for non-nullable FK columns being added to existing tables.
+    // These require table recreation because existing rows can't satisfy the FK constraint.
+    let recreate_tables = find_non_nullable_fk_add_columns(&plan, &current_models);
+    if !recreate_tables.is_empty() {
+        if !prompt_recreate_tables(&recreate_tables)? {
+            anyhow::bail!(
+                "Migration cancelled. To proceed without recreation, make the column nullable \
+                 or add it with a default value that references an existing row."
+            );
+        }
+        rewrite_plan_for_recreation(&mut plan, &recreate_tables, &current_models);
+
+        // Re-check: if plan is now empty after recreation rewrite, nothing to do
+        if plan.actions.is_empty() {
+            println!(
+                "{} {}",
+                "No changes detected.".bright_yellow(),
+                "Nothing to migrate.".bright_white()
+            );
+            return Ok(());
+        }
+    }
 
     // Reconstruct baseline schema for column type lookups
     let baseline_schema = schema_from_plans(&applied_plans)
@@ -626,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn check_non_nullable_fk_add_column_fails() {
+    fn find_non_nullable_fk_add_column_detects_recreate() {
         use vespertide_core::{ColumnDef, ColumnType, SimpleColumnType};
         let plan = MigrationPlan {
             id: String::new(),
@@ -662,18 +842,15 @@ mod tests {
                 },
             ],
         };
-        let result = check_non_nullable_fk_add_columns(&plan);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("user_id"),
-            "error should mention column: {msg}"
-        );
-        assert!(msg.contains("post"), "error should mention table: {msg}");
+        let result = find_non_nullable_fk_add_columns(&plan, &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].table, "post");
+        assert_eq!(result[0].column, "user_id");
+        assert_eq!(result[0].reason, RecreateReason::AddColumnWithFk);
     }
 
     #[test]
-    fn check_nullable_fk_add_column_ok() {
+    fn find_nullable_fk_add_column_returns_empty() {
         use vespertide_core::{ColumnDef, ColumnType, SimpleColumnType};
         let plan = MigrationPlan {
             id: String::new(),
@@ -709,12 +886,12 @@ mod tests {
                 },
             ],
         };
-        assert!(check_non_nullable_fk_add_columns(&plan).is_ok());
+        assert!(find_non_nullable_fk_add_columns(&plan, &[]).is_empty());
     }
 
     #[test]
-    fn check_non_nullable_no_fk_passes() {
-        // Regular non-nullable column without FK should NOT be blocked
+    fn find_non_nullable_no_fk_returns_empty() {
+        // Regular non-nullable column without FK should NOT trigger recreation
         use vespertide_core::{ColumnDef, ColumnType, SimpleColumnType};
         let plan = MigrationPlan {
             id: String::new(),
@@ -737,8 +914,186 @@ mod tests {
                 fill_with: None,
             }],
         };
-        // Should pass — this column needs fill_with but that's handled separately
-        assert!(check_non_nullable_fk_add_columns(&plan).is_ok());
+        // Should return empty — this column needs fill_with but that's handled separately
+        assert!(find_non_nullable_fk_add_columns(&plan, &[]).is_empty());
+    }
+
+    #[test]
+    fn find_fk_on_existing_non_nullable_column_detects_recreate() {
+        // Adding FK constraint to an existing non-nullable column should trigger recreation
+        use vespertide_core::{ColumnDef, ColumnType, SimpleColumnType};
+        let plan = MigrationPlan {
+            id: String::new(),
+            comment: None,
+            created_at: None,
+            version: 2,
+            actions: vec![MigrationAction::AddConstraint {
+                table: "post".into(),
+                constraint: TableConstraint::ForeignKey {
+                    name: None,
+                    columns: vec!["user_id".into()],
+                    ref_table: "user".into(),
+                    ref_columns: vec!["id".into()],
+                    on_delete: None,
+                    on_update: None,
+                },
+            }],
+        };
+        let models = vec![TableDef {
+            name: "post".into(),
+            description: None,
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    r#type: ColumnType::Simple(SimpleColumnType::Integer),
+                    nullable: false,
+                    default: None,
+                    comment: None,
+                    primary_key: None,
+                    unique: None,
+                    index: None,
+                    foreign_key: None,
+                },
+                ColumnDef {
+                    name: "user_id".into(),
+                    r#type: ColumnType::Simple(SimpleColumnType::Uuid),
+                    nullable: false,
+                    default: None,
+                    comment: None,
+                    primary_key: None,
+                    unique: None,
+                    index: None,
+                    foreign_key: None,
+                },
+            ],
+            constraints: vec![],
+        }];
+        let result = find_non_nullable_fk_add_columns(&plan, &models);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].table, "post");
+        assert_eq!(result[0].column, "user_id");
+        assert_eq!(result[0].reason, RecreateReason::AddFkToExistingColumn);
+    }
+
+    #[test]
+    fn find_fk_on_existing_nullable_column_returns_empty() {
+        // Adding FK constraint to an existing nullable column should NOT trigger recreation
+        use vespertide_core::{ColumnDef, ColumnType, SimpleColumnType};
+        let plan = MigrationPlan {
+            id: String::new(),
+            comment: None,
+            created_at: None,
+            version: 2,
+            actions: vec![MigrationAction::AddConstraint {
+                table: "post".into(),
+                constraint: TableConstraint::ForeignKey {
+                    name: None,
+                    columns: vec!["user_id".into()],
+                    ref_table: "user".into(),
+                    ref_columns: vec!["id".into()],
+                    on_delete: None,
+                    on_update: None,
+                },
+            }],
+        };
+        let models = vec![TableDef {
+            name: "post".into(),
+            description: None,
+            columns: vec![ColumnDef {
+                name: "user_id".into(),
+                r#type: ColumnType::Simple(SimpleColumnType::Uuid),
+                nullable: true,
+                default: None,
+                comment: None,
+                primary_key: None,
+                unique: None,
+                index: None,
+                foreign_key: None,
+            }],
+            constraints: vec![],
+        }];
+        assert!(find_non_nullable_fk_add_columns(&plan, &models).is_empty());
+    }
+
+    #[test]
+    fn rewrite_plan_replaces_actions_with_recreate() {
+        use vespertide_core::{ColumnDef, ColumnType, SimpleColumnType};
+        let mut plan = MigrationPlan {
+            id: String::new(),
+            comment: None,
+            created_at: None,
+            version: 2,
+            actions: vec![
+                MigrationAction::AddColumn {
+                    table: "post".into(),
+                    column: Box::new(ColumnDef {
+                        name: "user_id".into(),
+                        r#type: ColumnType::Simple(SimpleColumnType::Uuid),
+                        nullable: false,
+                        default: None,
+                        comment: None,
+                        primary_key: None,
+                        unique: None,
+                        index: None,
+                        foreign_key: None,
+                    }),
+                    fill_with: None,
+                },
+                MigrationAction::AddConstraint {
+                    table: "post".into(),
+                    constraint: TableConstraint::ForeignKey {
+                        name: None,
+                        columns: vec!["user_id".into()],
+                        ref_table: "user".into(),
+                        ref_columns: vec!["id".into()],
+                        on_delete: None,
+                        on_update: None,
+                    },
+                },
+            ],
+        };
+
+        let recreate = vec![RecreateTableRequired {
+            table: "post".into(),
+            column: "user_id".into(),
+            reason: RecreateReason::AddColumnWithFk,
+        }];
+
+        let models = vec![TableDef {
+            name: "post".into(),
+            description: None,
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    r#type: ColumnType::Simple(SimpleColumnType::Integer),
+                    nullable: false,
+                    default: None,
+                    comment: None,
+                    primary_key: None,
+                    unique: None,
+                    index: None,
+                    foreign_key: None,
+                },
+                ColumnDef {
+                    name: "user_id".into(),
+                    r#type: ColumnType::Simple(SimpleColumnType::Uuid),
+                    nullable: false,
+                    default: None,
+                    comment: None,
+                    primary_key: None,
+                    unique: None,
+                    index: None,
+                    foreign_key: None,
+                },
+            ],
+            constraints: vec![],
+        }];
+
+        rewrite_plan_for_recreation(&mut plan, &recreate, &models);
+
+        assert_eq!(plan.actions.len(), 2);
+        assert!(matches!(&plan.actions[0], MigrationAction::DeleteTable { table } if table == "post"));
+        assert!(matches!(&plan.actions[1], MigrationAction::CreateTable { table, .. } if table == "post"));
     }
 
     #[test]
