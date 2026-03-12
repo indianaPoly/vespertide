@@ -7,9 +7,7 @@ use std::path::PathBuf;
 use proc_macro::TokenStream;
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, Token};
-use vespertide_loader::{
-    load_config_or_default, load_migrations_at_compile_time, load_models_at_compile_time,
-};
+use vespertide_loader::{load_config_or_default, load_migrations_at_compile_time};
 use vespertide_planner::apply_action;
 use vespertide_query::{DatabaseBackend, build_plan_queries};
 
@@ -235,18 +233,6 @@ pub(crate) fn vespertide_migration_impl(
             .to_compile_error();
         }
     };
-    let _models = match load_models_at_compile_time() {
-        Ok(models) => models,
-        #[cfg(not(tarpaulin_include))]
-        Err(e) => {
-            return syn::Error::new(
-                proc_macro2::Span::call_site(),
-                format!("Failed to load models at compile time: {}", e),
-            )
-            .to_compile_error();
-        }
-    };
-
     // Apply prefix to migrations and build SQL using incremental baseline schema
     let mut baseline_schema = Vec::new();
     let mut migration_blocks = Vec::new();
@@ -1055,6 +1041,81 @@ mod tests {
         );
 
         // Restore CARGO_MANIFEST_DIR
+        if let Some(val) = original {
+            unsafe {
+                std::env::set_var("CARGO_MANIFEST_DIR", val);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("CARGO_MANIFEST_DIR");
+            }
+        }
+    }
+
+    #[test]
+    fn test_vespertide_migration_impl_ignores_invalid_models() {
+        use std::fs;
+
+        let dir = tempdir().unwrap();
+        let project_dir = dir.path();
+
+        let config_content = r#"{
+            "modelsDir": "models",
+            "migrationsDir": "migrations",
+            "tableNamingCase": "snake",
+            "columnNamingCase": "snake",
+            "modelFormat": "json"
+        }"#;
+        fs::write(project_dir.join("vespertide.json"), config_content).unwrap();
+
+        fs::create_dir_all(project_dir.join("models")).unwrap();
+        fs::create_dir_all(project_dir.join("migrations")).unwrap();
+
+        fs::write(
+            project_dir.join("models").join("broken.json"),
+            r#"{
+                "name": "broken",
+                "columns": [
+                    {"name": "user_id", "type": "integer", "nullable": false, "foreign_key": "invalid_format"}
+                ],
+                "constraints": []
+            }"#,
+        )
+        .unwrap();
+
+        fs::write(
+            project_dir.join("migrations").join("0001_initial.json"),
+            r#"{
+                "version": 1,
+                "actions": [
+                    {
+                        "type": "create_table",
+                        "table": "users",
+                        "columns": [
+                            {"name": "id", "type": "integer", "nullable": false}
+                        ],
+                        "constraints": []
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let original = std::env::var("CARGO_MANIFEST_DIR").ok();
+        unsafe {
+            std::env::set_var("CARGO_MANIFEST_DIR", project_dir);
+        }
+
+        let input: proc_macro2::TokenStream = "pool".parse().unwrap();
+        let output = vespertide_migration_impl(input);
+        let output_str = output.to_string();
+
+        assert!(
+            output_str.contains("async"),
+            "Expected migration code generation to ignore invalid models, got: {}",
+            output_str
+        );
+
         if let Some(val) = original {
             unsafe {
                 std::env::set_var("CARGO_MANIFEST_DIR", val);
