@@ -11,3 +11,4 @@ description = "Rust workspace for defining database schemas in JSON and generati
 [dependencies]
 vespertide-macro = { workspace = true }
 vespertide-core = { workspace = true }
+sea-orm = { version = "2.0.0-rc.36", default-features = false }

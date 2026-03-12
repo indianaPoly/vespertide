@@ -11,7 +11,7 @@ use vespertide_loader::{
     load_config_or_default, load_migrations_at_compile_time, load_models_at_compile_time,
 };
 use vespertide_planner::apply_action;
-use vespertide_query::{build_plan_queries, DatabaseBackend};
+use vespertide_query::{DatabaseBackend, build_plan_queries};
 
 struct MacroInput {
     pool: proc_macro2::TokenStream,
@@ -132,191 +132,41 @@ fn generate_migration_code(
     // Build entire output as a String, parse once at the end.
     // This avoids per-token IPC overhead from quote! (see rust-lang/rust#65080).
     let pool_str = pool.to_string();
-    let mut code = String::with_capacity(2_097_152); // 2MB pre-allocation
+    let mut code = String::with_capacity(1_048_576);
 
     code.push_str("{\n");
 
-    // Emit static SQL arrays (outside async block for zero runtime cost)
+    // Emit compact SQL blobs (outside async block for zero runtime cost).
     for b in &migration_blocks {
-        write_static_array(&mut code, &format!("__V{}_PG", b.version), &b.pg_sqls);
-        write_static_array(&mut code, &format!("__V{}_MYSQL", b.version), &b.mysql_sqls);
-        write_static_array(
+        write_sql_blob(&mut code, &format!("__V{}_PG", b.version), &b.pg_sqls);
+        write_sql_blob(&mut code, &format!("__V{}_MYSQL", b.version), &b.mysql_sqls);
+        write_sql_blob(
             &mut code,
             &format!("__V{}_SQLITE", b.version),
             &b.sqlite_sqls,
         );
     }
 
-    // Begin async block
-    code.push_str("async {\n");
-    code.push_str("use sea_orm::{ConnectionTrait, TransactionTrait};\n");
-    writeln!(code, "let __pool = &{pool_str};").unwrap();
-    writeln!(code, "let __version_table = {version_table:?};").unwrap();
-    code.push_str("let backend = __pool.get_database_backend();\n");
     code.push_str(
-        "let q = if matches!(backend, sea_orm::DatabaseBackend::MySql) { '`' } else { '\"' };\n",
+        "static __VESPERTIDE_MIGRATIONS: &[::vespertide::runtime::EmbeddedMigration] = &[\n",
     );
-
-    // Create version table (outside transaction)
-    code.push_str(concat!(
-        "let create_table_sql = format!(",
-        "\"CREATE TABLE IF NOT EXISTS {q}{}{q} (version INTEGER PRIMARY KEY, ",
-        "id TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)\", ",
-        "__version_table);\n",
-    ));
-    code.push_str("let stmt = sea_orm::Statement::from_string(backend, create_table_sql);\n");
-    code.push_str(concat!(
-        "__pool.execute_raw(stmt).await.map_err(|e| ",
-        "::vespertide::MigrationError::DatabaseError(",
-        "format!(\"Failed to create version table: {}\", e)))?;\n",
-    ));
-
-    // Add id column for backward compatibility
-    code.push_str(concat!(
-        "let alter_sql = format!(\"ALTER TABLE {q}{}{q} ADD COLUMN id TEXT DEFAULT ''\", ",
-        "__version_table);\n",
-    ));
-    code.push_str("let stmt = sea_orm::Statement::from_string(backend, alter_sql);\n");
-    code.push_str("let _ = __pool.execute_raw(stmt).await;\n");
-
-    // Begin transaction
-    code.push_str(concat!(
-        "let __txn = __pool.begin().await.map_err(|e| ",
-        "::vespertide::MigrationError::DatabaseError(",
-        "format!(\"Failed to begin transaction: {}\", e)))?;\n",
-    ));
-
-    // Read current version
-    code.push_str(concat!(
-        "let select_sql = format!(\"SELECT MAX(version) as version FROM {q}{}{q}\", ",
-        "__version_table);\n",
-    ));
-    code.push_str("let stmt = sea_orm::Statement::from_string(backend, select_sql);\n");
-    code.push_str(concat!(
-        "let version_result = __txn.query_one_raw(stmt).await.map_err(|e| ",
-        "::vespertide::MigrationError::DatabaseError(",
-        "format!(\"Failed to read version: {}\", e)))?;\n",
-    ));
-    code.push_str(concat!(
-        "let __version = version_result",
-        ".and_then(|row| row.try_get::<i32>(\"\", \"version\").ok())",
-        ".unwrap_or(0) as u32;\n",
-    ));
-
-    // Load version ids for mismatch validation
-    code.push_str(concat!(
-        "let select_ids_sql = format!(\"SELECT version, id FROM {q}{}{q}\", ",
-        "__version_table);\n",
-    ));
-    code.push_str("let stmt = sea_orm::Statement::from_string(backend, select_ids_sql);\n");
-    code.push_str(concat!(
-        "let id_rows = __txn.query_all_raw(stmt).await.map_err(|e| ",
-        "::vespertide::MigrationError::DatabaseError(",
-        "format!(\"Failed to read version ids: {}\", e)))?;\n",
-    ));
-    code.push_str("let mut __version_ids = std::collections::HashMap::<u32, String>::new();\n");
-    code.push_str(concat!(
-        "for row in &id_rows { ",
-        "if let Ok(v) = row.try_get::<i32>(\"\", \"version\") { ",
-        "let id = row.try_get::<String>(\"\", \"id\").unwrap_or_default(); ",
-        "__version_ids.insert(v as u32, id); ",
-        "} }\n",
-    ));
-
-    // Verbose: current version
-    if verbose {
-        code.push_str("eprintln!(\"[vespertide] Current database version: {}\", __version);\n");
+    for b in &migration_blocks {
+        writeln!(
+            code,
+            "::vespertide::runtime::EmbeddedMigration::new({}u32, {:?}, {:?}, __V{}_PG, __V{}_MYSQL, __V{}_SQLITE),",
+            b.version, b.migration_id, b.comment, b.version, b.version, b.version
+        )
+        .unwrap();
     }
+    code.push_str("];\n");
 
-    // Data-driven migration loop
-    if !migration_blocks.is_empty() {
-        code.push_str("for (__v, __mid, __comment, __pg_sqls, __mysql_sqls, __sqlite_sqls) in [\n");
-        for b in &migration_blocks {
-            writeln!(
-                code,
-                "({}u32, {:?}, {:?}, __V{}_PG, __V{}_MYSQL, __V{}_SQLITE),",
-                b.version, b.migration_id, b.comment, b.version, b.version, b.version
-            )
-            .unwrap();
-        }
-        code.push_str("] {\n");
-
-        // Loop body: validation + execution (written ONCE)
-        code.push_str("if __version < __v {\n");
-
-        // Id mismatch validation
-        code.push_str(concat!(
-            "if let Some(db_id) = __version_ids.get(&__v) { ",
-            "let expected_id: &str = __mid; ",
-            "if !expected_id.is_empty() && !db_id.is_empty() && db_id != expected_id { ",
-            "return Err(::vespertide::MigrationError::IdMismatch { ",
-            "version: __v, expected: expected_id.to_string(), found: db_id.clone() }); ",
-            "} }\n",
-        ));
-
-        // Verbose: applying
-        if verbose {
-            code.push_str(
-                "eprintln!(\"[vespertide] Applying migration v{} ({})\", __v, __comment);\n",
-            );
-        }
-
-        // Backend match
-        code.push_str(concat!(
-            "let __sqls: &[&str] = match backend { ",
-            "sea_orm::DatabaseBackend::Postgres => __pg_sqls, ",
-            "sea_orm::DatabaseBackend::MySql => __mysql_sqls, ",
-            "sea_orm::DatabaseBackend::Sqlite => __sqlite_sqls, ",
-            "_ => __pg_sqls };\n",
-        ));
-
-        // SQL execution loop
-        code.push_str("for (__sql_idx, __sql) in __sqls.iter().enumerate() {\n");
-        code.push_str("if !__sql.is_empty() {\n");
-        if verbose {
-            code.push_str(concat!(
-                "eprintln!(\"[vespertide]   [{}/{}] {}\", ",
-                "__sql_idx + 1, __sqls.len(), __sql);\n",
-            ));
-        }
-        code.push_str(concat!(
-            "let stmt = sea_orm::Statement::from_string(backend, *__sql);\n",
-            "__txn.execute_raw(stmt).await.map_err(|e| ",
-            "::vespertide::MigrationError::DatabaseError(",
-            "format!(\"Failed to execute SQL '{}': {}\", __sql, e)))?;\n",
-        ));
-        code.push_str("}\n"); // if !empty
-        code.push_str("}\n"); // for __sql
-
-        // Insert version record
-        code.push_str(concat!(
-            "let insert_sql = format!(\"INSERT INTO {q}{}{q} (version, id) VALUES ({}, '{}')\", ",
-            "__version_table, __v, __mid);\n",
-        ));
-        code.push_str("let stmt = sea_orm::Statement::from_string(backend, insert_sql);\n");
-        code.push_str(concat!(
-            "__txn.execute_raw(stmt).await.map_err(|e| ",
-            "::vespertide::MigrationError::DatabaseError(",
-            "format!(\"Failed to insert version: {}\", e)))?;\n",
-        ));
-
-        // Verbose: done
-        if verbose {
-            code.push_str("eprintln!(\"[vespertide] Migration v{} applied successfully\", __v);\n");
-        }
-
-        code.push_str("}\n"); // if __version < __v
-        code.push_str("}\n"); // for loop
-    }
-
-    // Commit transaction
-    code.push_str(concat!(
-        "__txn.commit().await.map_err(|e| ",
-        "::vespertide::MigrationError::DatabaseError(",
-        "format!(\"Failed to commit transaction: {}\", e)))?;\n",
-    ));
-
-    code.push_str("Ok::<(), ::vespertide::MigrationError>(())\n");
+    code.push_str("async {\n");
+    writeln!(code, "let __pool = &{pool_str};").unwrap();
+    writeln!(
+        code,
+        "::vespertide::runtime::run_embedded_migrations(__pool, {version_table:?}, {verbose}, __VESPERTIDE_MIGRATIONS).await"
+    )
+    .unwrap();
     code.push_str("}\n"); // async block
     code.push_str("}\n"); // outer block
 
@@ -326,16 +176,15 @@ fn generate_migration_code(
     })
 }
 
-/// Write a static `&[&str]` array declaration into the code string.
-fn write_static_array(code: &mut String, ident: &str, sqls: &[String]) {
-    write!(code, "static {ident}: &[&str] = &[").unwrap();
-    for (i, sql) in sqls.iter().enumerate() {
-        if i > 0 {
-            code.push_str(", ");
-        }
-        write!(code, "{sql:?}").unwrap();
+/// Write a compact SQL blob declaration into the code string.
+fn write_sql_blob(code: &mut String, ident: &str, sqls: &[String]) {
+    let mut blob = String::new();
+    for sql in sqls {
+        blob.push_str(sql);
+        blob.push('\0');
     }
-    code.push_str("];\n");
+
+    writeln!(code, "static {ident}: &str = {blob:?};").unwrap();
 }
 
 /// Inner implementation that works with proc_macro2::TokenStream for testability.
@@ -692,9 +541,8 @@ mod tests {
         assert!(generated_str.contains("async"));
         assert!(generated_str.contains("db_pool"));
         assert!(generated_str.contains("test_versions"));
-        assert!(generated_str.contains("CREATE TABLE IF NOT EXISTS"));
-        assert!(generated_str.contains("SELECT MAX"));
-        // Verify data-driven loop structure
+        assert!(generated_str.contains("run_embedded_migrations"));
+        assert!(generated_str.contains("EmbeddedMigration"));
         assert!(generated_str.contains("1u32"));
     }
 
@@ -749,8 +597,35 @@ mod tests {
         // Both migration versions should be present in the metadata array
         assert!(generated_str.contains("1u32"));
         assert!(generated_str.contains("2u32"));
-        // Data-driven loop structure
-        assert!(generated_str.contains("__version < __v"));
+        assert!(generated_str.contains("__VESPERTIDE_MIGRATIONS"));
+    }
+
+    #[test]
+    fn test_generate_migration_code_delegates_runtime_execution() {
+        let pool: proc_macro2::TokenStream = "db_pool".parse().unwrap();
+
+        let migration = MigrationPlan {
+            id: String::new(),
+            version: 1,
+            comment: Some("initial".into()),
+            created_at: None,
+            actions: vec![MigrationAction::CreateTable {
+                table: "users".into(),
+                columns: vec![test_column("id")],
+                constraints: vec![],
+            }],
+        };
+
+        let mut baseline = Vec::new();
+        let block = build_migration_block(&migration, &mut baseline).unwrap();
+
+        let generated = generate_migration_code(&pool, "vespertide_version", vec![block], false);
+        let generated_str = generated.to_string();
+
+        assert!(generated_str.contains("run_embedded_migrations"));
+        assert!(generated_str.contains("EmbeddedMigration"));
+        assert!(!generated_str.contains("SELECT MAX"));
+        assert!(!generated_str.contains("execute_raw"));
     }
 
     #[test]
@@ -960,8 +835,8 @@ mod tests {
             output_str
         );
         assert!(
-            output_str.contains("CREATE TABLE IF NOT EXISTS"),
-            "Expected version table creation, got: {}",
+            output_str.contains("run_embedded_migrations"),
+            "Expected runtime helper delegation, got: {}",
             output_str
         );
 
@@ -1106,9 +981,7 @@ mod tests {
         let generated = generate_migration_code(&pool, version_table, vec![block], true);
         let generated_str = generated.to_string();
 
-        // Verbose mode should include logging in the data-driven loop
-        assert!(generated_str.contains("Current database version"));
-        assert!(generated_str.contains("Applying migration"));
+        assert!(generated_str.contains("run_embedded_migrations"));
         assert!(generated_str.contains("async"));
     }
 
