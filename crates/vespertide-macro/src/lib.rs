@@ -1,17 +1,17 @@
 // MigrationOptions and MigrationError are now in vespertide-core
 
 use std::env;
+use std::fmt::Write;
 use std::path::PathBuf;
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, Token};
 use vespertide_loader::{
     load_config_or_default, load_migrations_at_compile_time, load_models_at_compile_time,
 };
 use vespertide_planner::apply_action;
-use vespertide_query::{DatabaseBackend, build_plan_queries};
+use vespertide_query::{build_plan_queries, DatabaseBackend};
 
 struct MacroInput {
     pool: proc_macro2::TokenStream,
@@ -58,23 +58,21 @@ impl Parse for MacroInput {
     }
 }
 
-/// Generated migration block with static SQL arrays and metadata for the data-driven loop.
+/// Generated migration block with raw SQL strings for string-based codegen.
 #[derive(Debug)]
 pub(crate) struct MigrationBlock {
-    /// Static array declarations (placed outside async block)
-    pub statics: proc_macro2::TokenStream,
     /// Migration version number
     pub version: u32,
     /// Migration ID for validation
     pub migration_id: String,
     /// Migration comment (for verbose logging)
     pub comment: String,
-    /// Identifier for PostgreSQL static array
-    pub pg_ident: proc_macro2::Ident,
-    /// Identifier for MySQL static array
-    pub mysql_ident: proc_macro2::Ident,
-    /// Identifier for SQLite static array
-    pub sqlite_ident: proc_macro2::Ident,
+    /// PostgreSQL SQL statements
+    pub pg_sqls: Vec<String>,
+    /// MySQL SQL statements
+    pub mysql_sqls: Vec<String>,
+    /// SQLite SQL statements
+    pub sqlite_sqls: Vec<String>,
 }
 
 pub(crate) fn build_migration_block(
@@ -96,7 +94,7 @@ pub(crate) fn build_migration_block(
         let _ = apply_action(baseline_schema, action);
     }
 
-    // Flatten all SQL into per-backend arrays
+    // Flatten all SQL into per-backend string arrays
     let mut pg_sqls = Vec::new();
     let mut mysql_sqls = Vec::new();
     let mut sqlite_sqls = Vec::new();
@@ -113,27 +111,15 @@ pub(crate) fn build_migration_block(
         }
     }
 
-    // Hoist SQL into static arrays outside the async block
-    let pg_ident = format_ident!("__V{}_PG", version);
-    let mysql_ident = format_ident!("__V{}_MYSQL", version);
-    let sqlite_ident = format_ident!("__V{}_SQLITE", version);
-
-    let statics = quote! {
-        static #pg_ident: &[&str] = &[#(#pg_sqls),*];
-        static #mysql_ident: &[&str] = &[#(#mysql_sqls),*];
-        static #sqlite_ident: &[&str] = &[#(#sqlite_sqls),*];
-    };
-
     let comment = migration.comment.as_deref().unwrap_or("").to_string();
 
     Ok(MigrationBlock {
-        statics,
         version,
         migration_id: migration.id.clone(),
         comment,
-        pg_ident,
-        mysql_ident,
-        sqlite_ident,
+        pg_sqls,
+        mysql_sqls,
+        sqlite_sqls,
     })
 }
 
@@ -143,185 +129,213 @@ fn generate_migration_code(
     migration_blocks: Vec<MigrationBlock>,
     verbose: bool,
 ) -> proc_macro2::TokenStream {
-    let verbose_current_version = if verbose {
-        quote! {
-            eprintln!("[vespertide] Current database version: {}", __version);
-        }
-    } else {
-        quote! {}
-    };
+    // Build entire output as a String, parse once at the end.
+    // This avoids per-token IPC overhead from quote! (see rust-lang/rust#65080).
+    let pool_str = pool.to_string();
+    let mut code = String::with_capacity(2_097_152); // 2MB pre-allocation
 
-    let verbose_start = if verbose {
-        quote! {
-            eprintln!("[vespertide] Applying migration v{} ({})", __v, __comment);
-        }
-    } else {
-        quote! {}
-    };
+    code.push_str("{\n");
 
-    let verbose_sql_log = if verbose {
-        quote! {
-            eprintln!("[vespertide]   [{}/{}] {}", __sql_idx + 1, __sqls.len(), __sql);
-        }
-    } else {
-        quote! {}
-    };
-
-    let verbose_end = if verbose {
-        quote! {
-            eprintln!("[vespertide] Migration v{} applied successfully", __v);
-        }
-    } else {
-        quote! {}
-    };
-
-    let all_statics: Vec<_> = migration_blocks.iter().map(|b| &b.statics).collect();
-
-    // Build metadata entries for the data-driven loop
-    let entries: Vec<_> = migration_blocks
-        .iter()
-        .map(|b| {
-            let version = b.version;
-            let id = &b.migration_id;
-            let comment = &b.comment;
-            let pg = &b.pg_ident;
-            let mysql = &b.mysql_ident;
-            let sqlite = &b.sqlite_ident;
-            quote! {
-                (#version, #id, #comment, #pg, #mysql, #sqlite)
-            }
-        })
-        .collect();
-
-    // Generate the migration loop (or nothing if no migrations)
-    let migration_loop = if entries.is_empty() {
-        quote! {}
-    } else {
-        quote! {
-            for (__v, __mid, __comment, __pg_sqls, __mysql_sqls, __sqlite_sqls) in [
-                #(#entries),*
-            ] {
-                if __version < __v {
-                    // Validate migration id against database if version already tracked
-                    if let Some(db_id) = __version_ids.get(&__v) {
-                        let expected_id: &str = __mid;
-                        if !expected_id.is_empty() && !db_id.is_empty() && db_id != expected_id {
-                            return Err(::vespertide::MigrationError::IdMismatch {
-                                version: __v,
-                                expected: expected_id.to_string(),
-                                found: db_id.clone(),
-                            });
-                        }
-                    }
-
-                    #verbose_start
-                    let __sqls: &[&str] = match backend {
-                        sea_orm::DatabaseBackend::Postgres => __pg_sqls,
-                        sea_orm::DatabaseBackend::MySql => __mysql_sqls,
-                        sea_orm::DatabaseBackend::Sqlite => __sqlite_sqls,
-                        _ => __pg_sqls,
-                    };
-                    for (__sql_idx, __sql) in __sqls.iter().enumerate() {
-                        if !__sql.is_empty() {
-                            #verbose_sql_log
-                            let stmt = sea_orm::Statement::from_string(backend, *__sql);
-                            __txn.execute_raw(stmt).await.map_err(|e| {
-                                ::vespertide::MigrationError::DatabaseError(
-                                    format!("Failed to execute SQL '{}': {}", __sql, e)
-                                )
-                            })?;
-                        }
-                    }
-
-                    let insert_sql = format!("INSERT INTO {q}{}{q} (version, id) VALUES ({}, '{}')", __version_table, __v, __mid);
-                    let stmt = sea_orm::Statement::from_string(backend, insert_sql);
-                    __txn.execute_raw(stmt).await.map_err(|e| {
-                        ::vespertide::MigrationError::DatabaseError(format!("Failed to insert version: {}", e))
-                    })?;
-
-                    #verbose_end
-                }
-            }
-        }
-    };
-
-    quote! {
-        {
-            #(#all_statics)*
-            async {
-                use sea_orm::{ConnectionTrait, TransactionTrait};
-                let __pool = &#pool;
-                let __version_table = #version_table;
-                let backend = __pool.get_database_backend();
-                let q = if matches!(backend, sea_orm::DatabaseBackend::MySql) { '`' } else { '"' };
-
-                // Create version table if it does not exist (outside transaction)
-                let create_table_sql = format!(
-                    "CREATE TABLE IF NOT EXISTS {q}{}{q} (version INTEGER PRIMARY KEY, id TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-                    __version_table
-                );
-                let stmt = sea_orm::Statement::from_string(backend, create_table_sql);
-                __pool.execute_raw(stmt).await.map_err(|e| {
-                    ::vespertide::MigrationError::DatabaseError(format!("Failed to create version table: {}", e))
-                })?;
-
-                // Add id column for existing tables that don't have it yet (backward compatibility).
-                // We use a try-and-ignore approach: if the column already exists, the ALTER will fail
-                // and we simply ignore the error.
-                let alter_sql = format!(
-                    "ALTER TABLE {q}{}{q} ADD COLUMN id TEXT DEFAULT ''",
-                    __version_table
-                );
-                let stmt = sea_orm::Statement::from_string(backend, alter_sql);
-                let _ = __pool.execute_raw(stmt).await;
-
-                // Single transaction for the entire migration process.
-                // This prevents race conditions when multiple connections exist
-                // (e.g. SQLite with max_connections > 1).
-                let __txn = __pool.begin().await.map_err(|e| {
-                    ::vespertide::MigrationError::DatabaseError(format!("Failed to begin transaction: {}", e))
-                })?;
-
-                // Read current maximum version inside the transaction (holds lock)
-                let select_sql = format!("SELECT MAX(version) as version FROM {q}{}{q}", __version_table);
-                let stmt = sea_orm::Statement::from_string(backend, select_sql);
-                let version_result = __txn.query_one_raw(stmt).await.map_err(|e| {
-                    ::vespertide::MigrationError::DatabaseError(format!("Failed to read version: {}", e))
-                })?;
-
-                let __version = version_result
-                    .and_then(|row| row.try_get::<i32>("", "version").ok())
-                    .unwrap_or(0) as u32;
-
-                // Load all existing (version, id) pairs for id mismatch validation
-                let select_ids_sql = format!("SELECT version, id FROM {q}{}{q}", __version_table);
-                let stmt = sea_orm::Statement::from_string(backend, select_ids_sql);
-                let id_rows = __txn.query_all_raw(stmt).await.map_err(|e| {
-                    ::vespertide::MigrationError::DatabaseError(format!("Failed to read version ids: {}", e))
-                })?;
-
-                let mut __version_ids = std::collections::HashMap::<u32, String>::new();
-                for row in &id_rows {
-                    if let Ok(v) = row.try_get::<i32>("", "version") {
-                        let id = row.try_get::<String>("", "id").unwrap_or_default();
-                        __version_ids.insert(v as u32, id);
-                    }
-                }
-
-                #verbose_current_version
-
-                // Execute migrations via data-driven loop
-                #migration_loop
-
-                // Commit the entire migration
-                __txn.commit().await.map_err(|e| {
-                    ::vespertide::MigrationError::DatabaseError(format!("Failed to commit transaction: {}", e))
-                })?;
-
-                Ok::<(), ::vespertide::MigrationError>(())
-            }
-        }
+    // Emit static SQL arrays (outside async block for zero runtime cost)
+    for b in &migration_blocks {
+        write_static_array(&mut code, &format!("__V{}_PG", b.version), &b.pg_sqls);
+        write_static_array(&mut code, &format!("__V{}_MYSQL", b.version), &b.mysql_sqls);
+        write_static_array(
+            &mut code,
+            &format!("__V{}_SQLITE", b.version),
+            &b.sqlite_sqls,
+        );
     }
+
+    // Begin async block
+    code.push_str("async {\n");
+    code.push_str("use sea_orm::{ConnectionTrait, TransactionTrait};\n");
+    writeln!(code, "let __pool = &{pool_str};").unwrap();
+    writeln!(code, "let __version_table = {version_table:?};").unwrap();
+    code.push_str("let backend = __pool.get_database_backend();\n");
+    code.push_str(
+        "let q = if matches!(backend, sea_orm::DatabaseBackend::MySql) { '`' } else { '\"' };\n",
+    );
+
+    // Create version table (outside transaction)
+    code.push_str(concat!(
+        "let create_table_sql = format!(",
+        "\"CREATE TABLE IF NOT EXISTS {q}{}{q} (version INTEGER PRIMARY KEY, ",
+        "id TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)\", ",
+        "__version_table);\n",
+    ));
+    code.push_str("let stmt = sea_orm::Statement::from_string(backend, create_table_sql);\n");
+    code.push_str(concat!(
+        "__pool.execute_raw(stmt).await.map_err(|e| ",
+        "::vespertide::MigrationError::DatabaseError(",
+        "format!(\"Failed to create version table: {}\", e)))?;\n",
+    ));
+
+    // Add id column for backward compatibility
+    code.push_str(concat!(
+        "let alter_sql = format!(\"ALTER TABLE {q}{}{q} ADD COLUMN id TEXT DEFAULT ''\", ",
+        "__version_table);\n",
+    ));
+    code.push_str("let stmt = sea_orm::Statement::from_string(backend, alter_sql);\n");
+    code.push_str("let _ = __pool.execute_raw(stmt).await;\n");
+
+    // Begin transaction
+    code.push_str(concat!(
+        "let __txn = __pool.begin().await.map_err(|e| ",
+        "::vespertide::MigrationError::DatabaseError(",
+        "format!(\"Failed to begin transaction: {}\", e)))?;\n",
+    ));
+
+    // Read current version
+    code.push_str(concat!(
+        "let select_sql = format!(\"SELECT MAX(version) as version FROM {q}{}{q}\", ",
+        "__version_table);\n",
+    ));
+    code.push_str("let stmt = sea_orm::Statement::from_string(backend, select_sql);\n");
+    code.push_str(concat!(
+        "let version_result = __txn.query_one_raw(stmt).await.map_err(|e| ",
+        "::vespertide::MigrationError::DatabaseError(",
+        "format!(\"Failed to read version: {}\", e)))?;\n",
+    ));
+    code.push_str(concat!(
+        "let __version = version_result",
+        ".and_then(|row| row.try_get::<i32>(\"\", \"version\").ok())",
+        ".unwrap_or(0) as u32;\n",
+    ));
+
+    // Load version ids for mismatch validation
+    code.push_str(concat!(
+        "let select_ids_sql = format!(\"SELECT version, id FROM {q}{}{q}\", ",
+        "__version_table);\n",
+    ));
+    code.push_str("let stmt = sea_orm::Statement::from_string(backend, select_ids_sql);\n");
+    code.push_str(concat!(
+        "let id_rows = __txn.query_all_raw(stmt).await.map_err(|e| ",
+        "::vespertide::MigrationError::DatabaseError(",
+        "format!(\"Failed to read version ids: {}\", e)))?;\n",
+    ));
+    code.push_str("let mut __version_ids = std::collections::HashMap::<u32, String>::new();\n");
+    code.push_str(concat!(
+        "for row in &id_rows { ",
+        "if let Ok(v) = row.try_get::<i32>(\"\", \"version\") { ",
+        "let id = row.try_get::<String>(\"\", \"id\").unwrap_or_default(); ",
+        "__version_ids.insert(v as u32, id); ",
+        "} }\n",
+    ));
+
+    // Verbose: current version
+    if verbose {
+        code.push_str("eprintln!(\"[vespertide] Current database version: {}\", __version);\n");
+    }
+
+    // Data-driven migration loop
+    if !migration_blocks.is_empty() {
+        code.push_str("for (__v, __mid, __comment, __pg_sqls, __mysql_sqls, __sqlite_sqls) in [\n");
+        for b in &migration_blocks {
+            writeln!(
+                code,
+                "({}u32, {:?}, {:?}, __V{}_PG, __V{}_MYSQL, __V{}_SQLITE),",
+                b.version, b.migration_id, b.comment, b.version, b.version, b.version
+            )
+            .unwrap();
+        }
+        code.push_str("] {\n");
+
+        // Loop body: validation + execution (written ONCE)
+        code.push_str("if __version < __v {\n");
+
+        // Id mismatch validation
+        code.push_str(concat!(
+            "if let Some(db_id) = __version_ids.get(&__v) { ",
+            "let expected_id: &str = __mid; ",
+            "if !expected_id.is_empty() && !db_id.is_empty() && db_id != expected_id { ",
+            "return Err(::vespertide::MigrationError::IdMismatch { ",
+            "version: __v, expected: expected_id.to_string(), found: db_id.clone() }); ",
+            "} }\n",
+        ));
+
+        // Verbose: applying
+        if verbose {
+            code.push_str(
+                "eprintln!(\"[vespertide] Applying migration v{} ({})\", __v, __comment);\n",
+            );
+        }
+
+        // Backend match
+        code.push_str(concat!(
+            "let __sqls: &[&str] = match backend { ",
+            "sea_orm::DatabaseBackend::Postgres => __pg_sqls, ",
+            "sea_orm::DatabaseBackend::MySql => __mysql_sqls, ",
+            "sea_orm::DatabaseBackend::Sqlite => __sqlite_sqls, ",
+            "_ => __pg_sqls };\n",
+        ));
+
+        // SQL execution loop
+        code.push_str("for (__sql_idx, __sql) in __sqls.iter().enumerate() {\n");
+        code.push_str("if !__sql.is_empty() {\n");
+        if verbose {
+            code.push_str(concat!(
+                "eprintln!(\"[vespertide]   [{}/{}] {}\", ",
+                "__sql_idx + 1, __sqls.len(), __sql);\n",
+            ));
+        }
+        code.push_str(concat!(
+            "let stmt = sea_orm::Statement::from_string(backend, *__sql);\n",
+            "__txn.execute_raw(stmt).await.map_err(|e| ",
+            "::vespertide::MigrationError::DatabaseError(",
+            "format!(\"Failed to execute SQL '{}': {}\", __sql, e)))?;\n",
+        ));
+        code.push_str("}\n"); // if !empty
+        code.push_str("}\n"); // for __sql
+
+        // Insert version record
+        code.push_str(concat!(
+            "let insert_sql = format!(\"INSERT INTO {q}{}{q} (version, id) VALUES ({}, '{}')\", ",
+            "__version_table, __v, __mid);\n",
+        ));
+        code.push_str("let stmt = sea_orm::Statement::from_string(backend, insert_sql);\n");
+        code.push_str(concat!(
+            "__txn.execute_raw(stmt).await.map_err(|e| ",
+            "::vespertide::MigrationError::DatabaseError(",
+            "format!(\"Failed to insert version: {}\", e)))?;\n",
+        ));
+
+        // Verbose: done
+        if verbose {
+            code.push_str("eprintln!(\"[vespertide] Migration v{} applied successfully\", __v);\n");
+        }
+
+        code.push_str("}\n"); // if __version < __v
+        code.push_str("}\n"); // for loop
+    }
+
+    // Commit transaction
+    code.push_str(concat!(
+        "__txn.commit().await.map_err(|e| ",
+        "::vespertide::MigrationError::DatabaseError(",
+        "format!(\"Failed to commit transaction: {}\", e)))?;\n",
+    ));
+
+    code.push_str("Ok::<(), ::vespertide::MigrationError>(())\n");
+    code.push_str("}\n"); // async block
+    code.push_str("}\n"); // outer block
+
+    // Single parse — ONE IPC call to rustc tokenizer
+    code.parse().unwrap_or_else(|e| {
+        panic!("vespertide_migration codegen produced invalid Rust:\n{e}\n\nGenerated code (first 2000 chars):\n{}", &code[..code.len().min(2000)])
+    })
+}
+
+/// Write a static `&[&str]` array declaration into the code string.
+fn write_static_array(code: &mut String, ident: &str, sqls: &[String]) {
+    write!(code, "static {ident}: &[&str] = &[").unwrap();
+    for (i, sql) in sqls.iter().enumerate() {
+        if i > 0 {
+            code.push_str(", ");
+        }
+        write!(code, "{sql:?}").unwrap();
+    }
+    code.push_str("];\n");
 }
 
 /// Inner implementation that works with proc_macro2::TokenStream for testability.
@@ -523,8 +537,22 @@ mod tests {
         }
     }
 
+    /// Concatenate all SQL strings from a block for assertion testing.
     fn block_to_string(block: &MigrationBlock) -> String {
-        block.statics.to_string()
+        let mut result = String::new();
+        for sql in &block.pg_sqls {
+            result.push_str(sql);
+            result.push(' ');
+        }
+        for sql in &block.mysql_sqls {
+            result.push_str(sql);
+            result.push(' ');
+        }
+        for sql in &block.sqlite_sqls {
+            result.push_str(sql);
+            result.push(' ');
+        }
+        result
     }
 
     #[test]
@@ -744,17 +772,25 @@ mod tests {
         assert!(result.is_ok());
 
         let block = result.unwrap();
-        let block_str = block_to_string(&block);
 
-        // Statics should have all three backend arrays
-        assert!(block_str.contains("__V1_PG"));
-        assert!(block_str.contains("__V1_MYSQL"));
-        assert!(block_str.contains("__V1_SQLITE"));
+        // All three backend SQL arrays should be populated
+        assert!(
+            !block.pg_sqls.is_empty(),
+            "PostgreSQL SQL should not be empty"
+        );
+        assert!(
+            !block.mysql_sqls.is_empty(),
+            "MySQL SQL should not be empty"
+        );
+        assert!(
+            !block.sqlite_sqls.is_empty(),
+            "SQLite SQL should not be empty"
+        );
 
-        // Verify ident names match
-        assert_eq!(block.pg_ident.to_string(), "__V1_PG");
-        assert_eq!(block.mysql_ident.to_string(), "__V1_MYSQL");
-        assert_eq!(block.sqlite_ident.to_string(), "__V1_SQLITE");
+        // Each should contain CREATE TABLE SQL
+        assert!(block.pg_sqls.iter().any(|s| s.contains("CREATE TABLE")));
+        assert!(block.mysql_sqls.iter().any(|s| s.contains("CREATE TABLE")));
+        assert!(block.sqlite_sqls.iter().any(|s| s.contains("CREATE TABLE")));
     }
 
     #[test]
@@ -789,8 +825,8 @@ mod tests {
 
         let result = build_migration_block(&delete_migration, &mut baseline);
         assert!(result.is_ok());
-        let block_str = block_to_string(&result.unwrap());
-        assert!(block_str.contains("DROP TABLE"));
+        let block = result.unwrap();
+        assert!(block.pg_sqls.iter().any(|s| s.contains("DROP TABLE")));
 
         // Baseline should be empty after delete
         assert_eq!(baseline.len(), 0);
@@ -964,9 +1000,8 @@ mod tests {
         // Metadata should capture comment for verbose logging in generate_migration_code
         assert_eq!(block.version, 1);
         assert_eq!(block.comment, "initial setup");
-        // SQL statics should still contain the SQL
-        let block_str = block_to_string(&block);
-        assert!(block_str.contains("CREATE TABLE"));
+        // SQL should contain CREATE TABLE
+        assert!(block.pg_sqls.iter().any(|s| s.contains("CREATE TABLE")));
     }
 
     #[test]
@@ -1044,8 +1079,8 @@ mod tests {
         let block = result.unwrap();
         assert_eq!(block.version, 2);
         assert_eq!(block.comment, "add email");
-        let block_str = block_to_string(&block);
-        assert!(block_str.contains("__V2_PG"));
+        // SQL should contain ALTER TABLE for the add column action
+        assert!(block.pg_sqls.iter().any(|s| s.contains("ALTER TABLE")));
     }
 
     #[test]

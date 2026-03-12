@@ -3850,7 +3850,6 @@ name = "vespertide-macro"
 version = "0.1.51"
 dependencies = [
  "proc-macro2",
- "quote",
  "runtime-macros",
  "syn 2.0.117",
  "tempfile",
