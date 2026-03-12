@@ -13,9 +13,9 @@ documentation = "https://docs.rs/vespertide"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
 
 [workspace.dependencies]
-vespertide-core = { path = "crates/vespertide-core", version = "0.1.51" }
-vespertide-config = { path = "crates/vespertide-config", version = "0.1.51" }
-vespertide-loader = { path = "crates/vespertide-loader", version = "0.1.51" }
+vespertide-core = { path = "crates/vespertide-core", version = "0.1.51", default-features = false }
+vespertide-config = { path = "crates/vespertide-config", version = "0.1.51", default-features = false }
+vespertide-loader = { path = "crates/vespertide-loader", version = "0.1.51", default-features = false }
 vespertide-macro = { path = "crates/vespertide-macro", version = "0.1.51" }
 vespertide-naming = { path = "crates/vespertide-naming", version = "0.1.51" }
 vespertide-planner = { path = "crates/vespertide-planner", version = "0.1.51" }

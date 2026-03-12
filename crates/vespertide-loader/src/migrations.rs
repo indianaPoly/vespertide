@@ -30,8 +30,18 @@ pub fn load_migrations(config: &VespertideConfig) -> Result<Vec<MigrationPlan>> 
                     serde_json::from_str(&content)
                         .with_context(|| format!("parse migration: {}", path.display()))?
                 } else {
-                    serde_yaml::from_str(&content)
-                        .with_context(|| format!("parse migration: {}", path.display()))?
+                    #[cfg(feature = "yaml")]
+                    {
+                        serde_yaml::from_str(&content)
+                            .with_context(|| format!("parse migration: {}", path.display()))?
+                    }
+                    #[cfg(not(feature = "yaml"))]
+                    {
+                        anyhow::bail!(
+                            "YAML support not enabled. Enable the 'yaml' feature or use JSON format: {}",
+                            path.display()
+                        );
+                    }
                 };
 
                 // Validate the migration plan
@@ -89,9 +99,19 @@ pub fn load_migrations_from_dir(
                         format!("Failed to parse JSON migration {}: {}", path.display(), e)
                     })?
                 } else {
-                    serde_yaml::from_str(&content).map_err(|e| {
-                        format!("Failed to parse YAML migration {}: {}", path.display(), e)
-                    })?
+                    #[cfg(feature = "yaml")]
+                    {
+                        serde_yaml::from_str(&content).map_err(|e| {
+                            format!("Failed to parse YAML migration {}: {}", path.display(), e)
+                        })?
+                    }
+                    #[cfg(not(feature = "yaml"))]
+                    {
+                        return Err(format!(
+                            "YAML support not enabled. Enable the 'yaml' feature or use JSON format: {}",
+                            path.display()
+                        ).into());
+                    }
                 };
 
                 plans.push(plan);
@@ -191,6 +211,7 @@ mod tests {
         assert_eq!(plans[2].version, 3);
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     fn test_load_migrations_from_dir_with_yaml_migration() {
         let temp_dir = TempDir::new().unwrap();
@@ -218,6 +239,7 @@ actions:
         assert_eq!(plans[0].version, 1);
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     fn test_load_migrations_from_dir_with_yml_migration() {
         let temp_dir = TempDir::new().unwrap();
@@ -260,6 +282,7 @@ actions:
         assert!(err_msg.contains("Failed to parse JSON migration"));
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     fn test_load_migrations_from_dir_with_invalid_yaml() {
         let temp_dir = TempDir::new().unwrap();

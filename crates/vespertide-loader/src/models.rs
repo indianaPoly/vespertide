@@ -59,8 +59,18 @@ fn load_models_recursive(dir: &Path, tables: &mut Vec<TableDef>) -> Result<()> {
                     serde_json::from_str(&content)
                         .with_context(|| format!("parse JSON model: {}", path.display()))?
                 } else {
-                    serde_yaml::from_str(&content)
-                        .with_context(|| format!("parse YAML model: {}", path.display()))?
+                    #[cfg(feature = "yaml")]
+                    {
+                        serde_yaml::from_str(&content)
+                            .with_context(|| format!("parse YAML model: {}", path.display()))?
+                    }
+                    #[cfg(not(feature = "yaml"))]
+                    {
+                        anyhow::bail!(
+                            "YAML support not enabled. Enable the 'yaml' feature or use JSON format: {}",
+                            path.display()
+                        );
+                    }
                 };
 
                 tables.push(table);
@@ -145,9 +155,19 @@ fn load_models_recursive_internal(
                         format!("Failed to parse JSON model {}: {}", path.display(), e)
                     })?
                 } else {
-                    serde_yaml::from_str(&content).map_err(|e| {
-                        format!("Failed to parse YAML model {}: {}", path.display(), e)
-                    })?
+                    #[cfg(feature = "yaml")]
+                    {
+                        serde_yaml::from_str(&content).map_err(|e| {
+                            format!("Failed to parse YAML model {}: {}", path.display(), e)
+                        })?
+                    }
+                    #[cfg(not(feature = "yaml"))]
+                    {
+                        return Err(format!(
+                            "YAML support not enabled. Enable the 'yaml' feature or use JSON format: {}",
+                            path.display()
+                        ).into());
+                    }
                 };
 
                 tables.push(table);
@@ -210,6 +230,7 @@ mod tests {
         assert_eq!(models.len(), 0);
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     #[serial]
     fn load_models_reads_yaml_and_validates() {
@@ -394,6 +415,7 @@ mod tests {
         assert_eq!(models.len(), 0);
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     #[serial]
     fn test_load_models_from_dir_with_yaml() {
@@ -430,6 +452,7 @@ mod tests {
         assert_eq!(models[0].name, "users");
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     #[serial]
     fn test_load_models_from_dir_with_yml() {
@@ -518,6 +541,7 @@ mod tests {
         assert!(err_msg.contains("Failed to parse JSON model"));
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     #[serial]
     fn test_load_models_from_dir_with_invalid_yaml() {
