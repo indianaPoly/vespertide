@@ -24,7 +24,7 @@ futures = "0.3"
 async-recursion = "1"
 vespertide-config = { workspace = true, features = ["cli", "schema"] }
 vespertide-core = { workspace = true, features = ["schema"] }
-vespertide-loader = { workspace = true, features = ["yaml"] }
+vespertide-loader = { workspace = true }
 vespertide-planner = { workspace = true }
 vespertide-query = { workspace = true }
 vespertide-exporter = { workspace = true }

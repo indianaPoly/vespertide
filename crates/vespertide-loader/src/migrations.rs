@@ -30,18 +30,8 @@ pub fn load_migrations(config: &VespertideConfig) -> Result<Vec<MigrationPlan>> 
                     serde_json::from_str(&content)
                         .with_context(|| format!("parse migration: {}", path.display()))?
                 } else {
-                    #[cfg(feature = "yaml")]
-                    {
-                        serde_yaml::from_str(&content)
-                            .with_context(|| format!("parse migration: {}", path.display()))?
-                    }
-                    #[cfg(not(feature = "yaml"))]
-                    {
-                        anyhow::bail!(
-                            "YAML support not enabled. Enable the 'yaml' feature or use JSON format: {}",
-                            path.display()
-                        );
-                    }
+                    serde_yaml::from_str(&content)
+                        .with_context(|| format!("parse migration: {}", path.display()))?
                 };
 
                 // Validate the migration plan
@@ -99,16 +89,9 @@ pub fn load_migrations_from_dir(
                         format!("Failed to parse JSON migration {}: {}", path.display(), e)
                     })?
                 } else {
-                    #[cfg(feature = "yaml")]
-                    {
-                        serde_yaml::from_str(&content).map_err(|e| {
-                            format!("Failed to parse YAML migration {}: {}", path.display(), e)
-                        })?
-                    }
-                    #[cfg(not(feature = "yaml"))]
-                    {
-                        return Err(format!("YAML support not enabled. Enable the 'yaml' feature or use JSON format: {}", path.display()).into());
-                    }
+                    serde_yaml::from_str(&content).map_err(|e| {
+                        format!("Failed to parse YAML migration {}: {}", path.display(), e)
+                    })?
                 };
 
                 plans.push(plan);
@@ -269,7 +252,6 @@ mod tests {
         assert_eq!(plans[2].version, 3);
     }
 
-    #[cfg(feature = "yaml")]
     #[test]
     fn test_load_migrations_from_dir_with_yaml_migration() {
         let temp_dir = TempDir::new().unwrap();
@@ -297,7 +279,6 @@ actions:
         assert_eq!(plans[0].version, 1);
     }
 
-    #[cfg(feature = "yaml")]
     #[test]
     fn test_load_migrations_from_dir_with_yml_migration() {
         let temp_dir = TempDir::new().unwrap();
@@ -326,6 +307,32 @@ actions:
     }
 
     #[test]
+    #[serial]
+    fn test_load_migrations_reads_yaml_for_runtime_loader() {
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = CwdGuard::new(&temp_dir.path().to_path_buf());
+        write_config(temp_dir.path());
+        fs::create_dir_all("migrations").unwrap();
+
+        let migration_content = r#"---
+version: 1
+actions:
+  - type: create_table
+    table: users
+    columns:
+      - name: id
+        type: integer
+        nullable: false
+    constraints: []
+"#;
+        fs::write("migrations/0001_test.yaml", migration_content).unwrap();
+
+        let plans = load_migrations(&VespertideConfig::default()).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].version, 1);
+    }
+
+    #[test]
     fn test_load_migrations_from_dir_with_invalid_json() {
         let temp_dir = TempDir::new().unwrap();
         let migrations_dir = temp_dir.path().join("migrations");
@@ -340,43 +347,6 @@ actions:
         assert!(err_msg.contains("Failed to parse JSON migration"));
     }
 
-    #[cfg(not(feature = "yaml"))]
-    #[test]
-    #[serial]
-    fn test_load_migrations_reports_yaml_disabled_for_runtime_loader() {
-        let temp_dir = TempDir::new().unwrap();
-        let _guard = CwdGuard::new(&temp_dir.path().to_path_buf());
-        write_config(temp_dir.path());
-        fs::create_dir_all("migrations").unwrap();
-        fs::write("migrations/0001_test.yaml", "version: 1\nactions: []\n").unwrap();
-
-        let result = load_migrations(&VespertideConfig::default());
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("YAML support not enabled"));
-        assert!(err_msg.contains("0001_test.yaml"));
-    }
-
-    #[cfg(not(feature = "yaml"))]
-    #[test]
-    fn test_load_migrations_from_dir_reports_yaml_disabled() {
-        let temp_dir = TempDir::new().unwrap();
-        let migrations_dir = temp_dir.path().join("migrations");
-        fs::create_dir_all(&migrations_dir).unwrap();
-        fs::write(
-            migrations_dir.join("0001_test.yaml"),
-            "version: 1\nactions: []\n",
-        )
-        .unwrap();
-
-        let result = load_migrations_from_dir(Some(temp_dir.path().to_path_buf()));
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("YAML support not enabled"));
-        assert!(err_msg.contains("0001_test.yaml"));
-    }
-
-    #[cfg(feature = "yaml")]
     #[test]
     fn test_load_migrations_from_dir_with_invalid_yaml() {
         let temp_dir = TempDir::new().unwrap();
