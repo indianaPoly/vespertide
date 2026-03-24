@@ -15,6 +15,7 @@ pub enum OrmArg {
     Seaorm,
     Sqlalchemy,
     Sqlmodel,
+    Jpa,
 }
 
 impl From<OrmArg> for Orm {
@@ -23,6 +24,7 @@ impl From<OrmArg> for Orm {
             OrmArg::Seaorm => Orm::SeaOrm,
             OrmArg::Sqlalchemy => Orm::SqlAlchemy,
             OrmArg::Sqlmodel => Orm::SqlModel,
+            OrmArg::Jpa => Orm::Jpa,
         }
     }
 }
@@ -133,6 +135,7 @@ async fn clean_export_dir(root: &Path, orm: Orm) -> Result<()> {
     let ext = match orm {
         Orm::SeaOrm => "rs",
         Orm::SqlAlchemy | Orm::SqlModel => "py",
+        Orm::Jpa => "java",
     };
 
     clean_dir_recursive(root, ext).await?;
@@ -224,11 +227,30 @@ fn build_output_path(root: &Path, rel_path: &Path, orm: Orm) -> PathBuf {
         let ext = match orm {
             Orm::SeaOrm => "rs",
             Orm::SqlAlchemy | Orm::SqlModel => "py",
+            Orm::Jpa => "java",
         };
-        out.set_file_name(format!("{}.{}", sanitized, ext));
+        // Java requires filename to match PascalCase class name
+        let file_stem = if matches!(orm, Orm::Jpa) {
+            to_pascal_case(&sanitized)
+        } else {
+            sanitized
+        };
+        out.set_file_name(format!("{}.{}", file_stem, ext));
     }
 
     out
+}
+
+fn to_pascal_case(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+            }
+        })
+        .collect()
 }
 
 fn sanitize_filename(name: &str) -> String {
