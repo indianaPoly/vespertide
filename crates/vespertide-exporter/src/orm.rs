@@ -1,6 +1,9 @@
 use vespertide_core::TableDef;
 
-use crate::{seaorm::SeaOrmExporter, sqlalchemy::SqlAlchemyExporter, sqlmodel::SqlModelExporter};
+use crate::{
+    jpa::JpaExporter, seaorm::SeaOrmExporter, sqlalchemy::SqlAlchemyExporter,
+    sqlmodel::SqlModelExporter,
+};
 
 /// Supported ORM targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,6 +11,7 @@ pub enum Orm {
     SeaOrm,
     SqlAlchemy,
     SqlModel,
+    Jpa,
 }
 
 /// Standardized exporter interface for all supported ORMs.
@@ -31,6 +35,7 @@ pub fn render_entity(orm: Orm, table: &TableDef) -> Result<String, String> {
         Orm::SeaOrm => SeaOrmExporter.render_entity(table),
         Orm::SqlAlchemy => SqlAlchemyExporter.render_entity(table),
         Orm::SqlModel => SqlModelExporter.render_entity(table),
+        Orm::Jpa => JpaExporter.render_entity(table),
     }
 }
 
@@ -44,6 +49,7 @@ pub fn render_entity_with_schema(
         Orm::SeaOrm => SeaOrmExporter.render_entity_with_schema(table, schema),
         Orm::SqlAlchemy => SqlAlchemyExporter.render_entity_with_schema(table, schema),
         Orm::SqlModel => SqlModelExporter.render_entity_with_schema(table, schema),
+        Orm::Jpa => JpaExporter.render_entity_with_schema(table, schema),
     }
 }
 
@@ -80,6 +86,7 @@ mod tests {
     #[case("seaorm", Orm::SeaOrm)]
     #[case("sqlalchemy", Orm::SqlAlchemy)]
     #[case("sqlmodel", Orm::SqlModel)]
+    #[case("jpa", Orm::Jpa)]
     fn test_render_entity_snapshots(#[case] name: &str, #[case] orm: Orm) {
         let table = simple_table();
         let result = render_entity(orm, &table);
@@ -93,6 +100,7 @@ mod tests {
     #[case("seaorm", Orm::SeaOrm)]
     #[case("sqlalchemy", Orm::SqlAlchemy)]
     #[case("sqlmodel", Orm::SqlModel)]
+    #[case("jpa", Orm::Jpa)]
     fn test_render_entity_with_schema_snapshots(#[case] name: &str, #[case] orm: Orm) {
         let table = simple_table();
         let schema = vec![table.clone()];
