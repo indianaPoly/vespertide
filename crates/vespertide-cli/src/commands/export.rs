@@ -883,6 +883,7 @@ mod tests {
     #[case("users", "Users")]
     #[case("a", "A")]
     #[case("user_profile_image", "UserProfileImage")]
+    #[case("a__b", "AB")]
     fn test_to_pascal_case(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(to_pascal_case(input), expected);
     }
