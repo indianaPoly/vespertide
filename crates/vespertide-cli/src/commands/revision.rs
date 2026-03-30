@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -10,8 +10,8 @@ use tokio::fs;
 use vespertide_config::FileFormat;
 use vespertide_core::{MigrationAction, MigrationPlan, TableConstraint, TableDef};
 use vespertide_planner::{
-    EnumFillWithRequired, find_missing_enum_fill_with, find_missing_fill_with, plan_next_migration,
-    schema_from_plans,
+    EnumFillWithRequired, FillWithRequired, find_missing_enum_fill_with, find_missing_fill_with,
+    plan_next_migration, schema_from_plans,
 };
 
 use crate::utils::{
@@ -30,6 +30,18 @@ fn parse_fill_with_args(args: &[String]) -> HashMap<(String, String), String> {
         }
     }
     map
+}
+
+/// Parse delete_null_rows arguments from CLI.
+/// Format: table.column
+fn parse_delete_null_rows_args(args: &[String]) -> HashSet<(String, String)> {
+    let mut set = HashSet::new();
+    for arg in args {
+        if let Some((table, column)) = arg.split_once('.') {
+            set.insert((table.to_string(), column.to_string()));
+        }
+    }
+    set
 }
 
 /// Format the type info string for display.
@@ -221,8 +233,31 @@ fn apply_fill_with_to_plan(
     }
 }
 
+/// Apply delete_null_rows flags to matching ModifyColumnNullable actions.
+fn apply_delete_null_rows_to_plan(
+    plan: &mut MigrationPlan,
+    delete_set: &HashSet<(String, String)>,
+) {
+    for action in &mut plan.actions {
+        if let MigrationAction::ModifyColumnNullable {
+            table,
+            column,
+            nullable,
+            delete_null_rows,
+            ..
+        } = action
+            && !*nullable
+            && delete_null_rows.is_none()
+            && delete_set.contains(&(table.clone(), column.clone()))
+        {
+            *delete_null_rows = Some(true);
+        }
+    }
+}
+
 /// Handle interactive fill_with collection if there are missing values.
 /// Returns the updated fill_values map after collecting from user.
+#[cfg(test)]
 fn handle_missing_fill_with<F, E>(
     plan: &mut MigrationPlan,
     fill_values: &mut HashMap<(String, String), String>,
@@ -243,6 +278,71 @@ where
         apply_fill_with_to_plan(plan, fill_values);
     }
 
+    Ok(())
+}
+
+#[cfg(not(tarpaulin_include))]
+fn prompt_delete_null_rows(table: &str, column: &str) -> Result<bool> {
+    let confirmed = Confirm::new()
+        .with_prompt(format!("  Delete rows where {}.{} IS NULL?", table, column))
+        .default(false)
+        .interact()
+        .context("failed to read confirmation")?;
+    Ok(confirmed)
+}
+
+fn handle_delete_null_rows<F>(
+    plan: &mut MigrationPlan,
+    missing: &mut Vec<FillWithRequired>,
+    delete_set: &HashSet<(String, String)>,
+    prompt_fn: F,
+) -> Result<()>
+where
+    F: Fn(&str, &str) -> Result<bool>,
+{
+    let mut to_delete = Vec::new();
+    let mut remaining = Vec::new();
+
+    for item in missing.drain(..) {
+        if item.has_foreign_key && !delete_set.contains(&(item.table.clone(), item.column.clone()))
+        {
+            // FK column without CLI arg — prompt user
+            println!(
+                "  {} {}.{} has a foreign key constraint — fill_with may not work.",
+                "\u{2022}".bright_cyan(),
+                item.table.bright_white(),
+                item.column.bright_green()
+            );
+            if prompt_fn(&item.table, &item.column)? {
+                to_delete.push((item.table.clone(), item.column.clone()));
+            } else {
+                remaining.push(item);
+            }
+        } else if delete_set.contains(&(item.table.clone(), item.column.clone())) {
+            to_delete.push((item.table.clone(), item.column.clone()));
+        } else {
+            remaining.push(item);
+        }
+    }
+
+    // Apply delete_null_rows to plan
+    for (table, column) in &to_delete {
+        for action in &mut plan.actions {
+            if let MigrationAction::ModifyColumnNullable {
+                table: t,
+                column: c,
+                delete_null_rows,
+                ..
+            } = action
+                && t == table
+                && c == column
+            {
+                *delete_null_rows = Some(true);
+            }
+        }
+    }
+
+    *missing = remaining;
     Ok(())
 }
 
@@ -549,7 +649,11 @@ where
     Ok(())
 }
 
-pub async fn cmd_revision(message: String, fill_with_args: Vec<String>) -> Result<()> {
+pub async fn cmd_revision(
+    message: String,
+    fill_with_args: Vec<String>,
+    delete_null_rows_args: Vec<String>,
+) -> Result<()> {
     let config = load_config()?;
     let current_models = load_models(&config)?;
     let applied_plans = load_migrations(&config)?;
@@ -575,18 +679,35 @@ pub async fn cmd_revision(message: String, fill_with_args: Vec<String>) -> Resul
 
     // Parse CLI fill_with arguments
     let mut fill_values = parse_fill_with_args(&fill_with_args);
+    let delete_set = parse_delete_null_rows_args(&delete_null_rows_args);
 
     // Apply any CLI-provided fill_with values first
     apply_fill_with_to_plan(&mut plan, &fill_values);
+    apply_delete_null_rows_to_plan(&mut plan, &delete_set);
 
-    // Handle any missing fill_with values interactively
-    handle_missing_fill_with(
-        &mut plan,
-        &mut fill_values,
-        &baseline_schema,
-        prompt_fill_with_value,
-        prompt_enum_value,
-    )?;
+    // Find all missing fill_with values
+    let mut missing = find_missing_fill_with(&plan, &baseline_schema);
+
+    // Handle FK columns with delete_null_rows option first
+    if !missing.is_empty() {
+        handle_delete_null_rows(
+            &mut plan,
+            &mut missing,
+            &delete_set,
+            prompt_delete_null_rows,
+        )?;
+    }
+
+    // Handle remaining missing fill_with values interactively
+    if !missing.is_empty() {
+        collect_fill_with_values(
+            &missing,
+            &mut fill_values,
+            prompt_fill_with_value,
+            prompt_enum_value,
+        )?;
+        apply_fill_with_to_plan(&mut plan, &fill_values);
+    }
 
     // Handle any missing enum fill_with values (for removed enum values) interactively
     handle_missing_enum_fill_with(&mut plan, &baseline_schema, prompt_enum_value_bare)?;
@@ -759,7 +880,7 @@ mod tests {
         write_model("users");
         std_fs::create_dir_all(cfg.migrations_dir()).unwrap();
 
-        cmd_revision("init".into(), vec![]).await.unwrap();
+        cmd_revision("init".into(), vec![], vec![]).await.unwrap();
 
         let entries: Vec<_> = std_fs::read_dir(cfg.migrations_dir()).unwrap().collect();
         assert!(!entries.is_empty());
@@ -773,7 +894,7 @@ mod tests {
 
         let cfg = write_config();
         // no models, no migrations -> plan with no actions -> early return
-        assert!(cmd_revision("noop".into(), vec![]).await.is_ok());
+        assert!(cmd_revision("noop".into(), vec![], vec![]).await.is_ok());
         // migrations dir should not be created
         assert!(!cfg.migrations_dir().exists());
     }
@@ -791,7 +912,7 @@ mod tests {
             std_fs::remove_dir_all(cfg.migrations_dir()).unwrap();
         }
 
-        cmd_revision("yaml".into(), vec![]).await.unwrap();
+        cmd_revision("yaml".into(), vec![], vec![]).await.unwrap();
 
         let entries: Vec<_> = std_fs::read_dir(cfg.migrations_dir()).unwrap().collect();
         assert!(!entries.is_empty());
@@ -1567,6 +1688,7 @@ mod tests {
                 column: "status".into(),
                 nullable: false,
                 fill_with: None,
+                delete_null_rows: None,
             }],
         };
 
@@ -1702,6 +1824,7 @@ mod tests {
                     column: "status".into(),
                     nullable: false,
                     fill_with: None,
+                    delete_null_rows: None,
                 },
             ],
         };
@@ -1868,6 +1991,7 @@ mod tests {
             column_type: "text".to_string(),
             default_value: "''".to_string(),
             enum_values: None,
+            has_foreign_key: false,
         }];
 
         let mut fill_values = HashMap::new();
@@ -1900,6 +2024,7 @@ mod tests {
                 column_type: "text".to_string(),
                 default_value: "''".to_string(),
                 enum_values: None,
+                has_foreign_key: false,
             },
             FillWithRequired {
                 action_index: 1,
@@ -1909,6 +2034,7 @@ mod tests {
                 column_type: "text".to_string(),
                 default_value: "''".to_string(),
                 enum_values: None,
+                has_foreign_key: false,
             },
         ];
 
@@ -1972,6 +2098,7 @@ mod tests {
             column_type: "text".to_string(),
             default_value: "''".to_string(),
             enum_values: None,
+            has_foreign_key: false,
         }];
 
         let mut fill_values = HashMap::new();
@@ -2178,6 +2305,7 @@ mod tests {
                     column: "status".into(),
                     nullable: false,
                     fill_with: None,
+                    delete_null_rows: None,
                 },
             ],
         };
@@ -2237,6 +2365,7 @@ mod tests {
                 "confirmed".to_string(),
                 "shipped".to_string(),
             ]),
+            has_foreign_key: false,
         }];
 
         let mut fill_values = HashMap::new();
