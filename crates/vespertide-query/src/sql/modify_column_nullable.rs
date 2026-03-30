@@ -448,4 +448,97 @@ mod tests {
             assert_snapshot!(sql);
         });
     }
+
+    /// Test delete_null_rows generates DELETE instead of UPDATE
+    #[rstest]
+    #[case::postgres_delete_null_rows(DatabaseBackend::Postgres)]
+    #[case::mysql_delete_null_rows(DatabaseBackend::MySql)]
+    #[case::sqlite_delete_null_rows(DatabaseBackend::Sqlite)]
+    fn test_delete_null_rows(#[case] backend: DatabaseBackend) {
+        let schema = vec![table_def(
+            "orders",
+            vec![
+                col("id", ColumnType::Simple(SimpleColumnType::Integer), false),
+                col(
+                    "user_id",
+                    ColumnType::Simple(SimpleColumnType::Integer),
+                    true,
+                ),
+            ],
+            vec![],
+        )];
+
+        let result =
+            build_modify_column_nullable(&backend, "orders", "user_id", false, None, true, &schema);
+        assert!(result.is_ok());
+        let queries = result.unwrap();
+        let sql = queries
+            .iter()
+            .map(|q| q.build(backend))
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(
+            sql.contains("DELETE FROM"),
+            "Expected DELETE FROM in SQL, got: {}",
+            sql
+        );
+        assert!(
+            sql.contains("IS NULL"),
+            "Expected IS NULL in SQL, got: {}",
+            sql
+        );
+        assert!(
+            !sql.contains("UPDATE"),
+            "Should NOT contain UPDATE, got: {}",
+            sql
+        );
+
+        let suffix = format!(
+            "{}_delete_null_rows",
+            match backend {
+                DatabaseBackend::Postgres => "postgres",
+                DatabaseBackend::MySql => "mysql",
+                DatabaseBackend::Sqlite => "sqlite",
+            }
+        );
+
+        with_settings!({ snapshot_suffix => suffix }, {
+            assert_snapshot!(sql);
+        });
+    }
+
+    /// Test delete_null_rows=true with nullable=true does nothing special
+    #[rstest]
+    #[case::postgres_delete_null_rows_nullable(DatabaseBackend::Postgres)]
+    fn test_delete_null_rows_with_nullable_true(#[case] backend: DatabaseBackend) {
+        let schema = vec![table_def(
+            "orders",
+            vec![
+                col("id", ColumnType::Simple(SimpleColumnType::Integer), false),
+                col(
+                    "user_id",
+                    ColumnType::Simple(SimpleColumnType::Integer),
+                    false,
+                ),
+            ],
+            vec![],
+        )];
+
+        let result =
+            build_modify_column_nullable(&backend, "orders", "user_id", true, None, true, &schema);
+        assert!(result.is_ok());
+        let queries = result.unwrap();
+        let sql = queries
+            .iter()
+            .map(|q| q.build(backend))
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        assert!(
+            !sql.contains("DELETE FROM"),
+            "Should NOT contain DELETE when nullable=true, got: {}",
+            sql
+        );
+    }
 }

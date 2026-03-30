@@ -515,12 +515,7 @@ pub fn find_missing_fill_with(
                     let col_def =
                         table_def.and_then(|t| t.columns.iter().find(|c| c.name == *column));
 
-                    let has_foreign_key = table_def
-                        .is_some_and(|t| {
-                            t.constraints.iter().any(|constraint| {
-                                matches!(constraint, TableConstraint::ForeignKey { columns, .. } if columns.iter().any(|col_name| col_name == column))
-                            })
-                        });
+                    let has_foreign_key = table_def.is_some_and(|t| t.constraints.iter().any(|constraint| matches!(constraint, TableConstraint::ForeignKey { columns, .. } if columns.iter().any(|col_name| col_name == column))));
 
                     // If column has a default value, fill_with is not needed
                     if col_def.is_some_and(|c| c.default.is_some()) {
