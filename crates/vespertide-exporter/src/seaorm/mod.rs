@@ -30,10 +30,10 @@ fn resolve_entity_module_path(
     module_paths: &HashMap<String, Vec<String>>,
     crate_prefix: &str,
 ) -> String {
-    if !crate_prefix.is_empty() {
-        if let Some(to) = module_paths.get(target_table) {
-            return absolute_module_path(crate_prefix, to);
-        }
+    if !crate_prefix.is_empty()
+        && let Some(to) = module_paths.get(target_table)
+    {
+        return absolute_module_path(crate_prefix, to);
     }
     format!("super::{target_table}")
 }
@@ -142,7 +142,8 @@ pub fn render_entity_with_config_and_paths(
 ) -> String {
     let primary_keys = primary_key_columns(table);
     let composite_pk = primary_keys.len() > 1;
-    let relation_fields = relation_field_defs_with_schema(table, schema, module_paths, crate_prefix);
+    let relation_fields =
+        relation_field_defs_with_schema(table, schema, module_paths, crate_prefix);
 
     // Build sets of columns with single-column unique constraints and indexes
     let unique_columns = single_column_unique_set(&table.constraints);
@@ -502,7 +503,12 @@ fn resolve_fk_target<'a>(
     (ref_table, ref_columns.to_vec())
 }
 
-fn relation_field_defs_with_schema(table: &TableDef, schema: &[TableDef], module_paths: &HashMap<String, Vec<String>>, crate_prefix: &str) -> Vec<String> {
+fn relation_field_defs_with_schema(
+    table: &TableDef,
+    schema: &[TableDef],
+    module_paths: &HashMap<String, Vec<String>>,
+    crate_prefix: &str,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut used = HashSet::new();
 
@@ -613,7 +619,8 @@ fn relation_field_defs_with_schema(table: &TableDef, schema: &[TableDef], module
             };
 
             out.push(attr);
-            let entity_path = resolve_entity_module_path(resolved_table, module_paths, crate_prefix);
+            let entity_path =
+                resolve_entity_module_path(resolved_table, module_paths, crate_prefix);
             out.push(format!(
                 "    pub {field_name}: HasOne<{entity_path}::Entity>,"
             ));
@@ -970,7 +977,8 @@ fn reverse_relation_field_defs(
         };
 
         out.push(attr);
-        let entity_path = resolve_entity_module_path(&rel.target_entity, module_paths, crate_prefix);
+        let entity_path =
+            resolve_entity_module_path(&rel.target_entity, module_paths, crate_prefix);
         out.push(format!(
             "    pub {field_name}: {rust_type}<{entity_path}::Entity>,"
         ));

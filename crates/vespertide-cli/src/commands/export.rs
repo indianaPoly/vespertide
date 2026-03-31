@@ -84,7 +84,12 @@ pub async fn cmd_export(orm: OrmArg, export_dir: Option<PathBuf>) -> Result<()> 
         .map(|(table, rel_path)| {
             let code = match orm_kind {
                 Orm::SeaOrm => seaorm_exporter
-                    .render_entity_with_schema_and_paths(table, &all_tables, &module_paths, &crate_prefix)
+                    .render_entity_with_schema_and_paths(
+                        table,
+                        &all_tables,
+                        &module_paths,
+                        &crate_prefix,
+                    )
                     .map_err(|e| anyhow::anyhow!(e)),
                 _ => render_entity_with_schema(orm_kind, table, &all_tables)
                     .map_err(|e| anyhow::anyhow!(e)),
@@ -137,14 +142,10 @@ pub async fn cmd_export(orm: OrmArg, export_dir: Option<PathBuf>) -> Result<()> 
 /// If the path doesn't start with `src/`, returns empty string (fallback to `super::` behavior).
 fn export_dir_to_crate_prefix(export_dir: &Path) -> String {
     let normalized = export_dir.to_string_lossy().replace('\\', "/");
-    let stripped = normalized
-        .strip_prefix("./")
-        .unwrap_or(&normalized);
+    let stripped = normalized.strip_prefix("./").unwrap_or(&normalized);
 
     if let Some(after_src) = stripped.strip_prefix("src/") {
-        let module_path = after_src
-            .trim_end_matches('/')
-            .replace('/', "::");
+        let module_path = after_src.trim_end_matches('/').replace('/', "::");
         format!("crate::{module_path}")
     } else {
         String::new()
@@ -161,10 +162,10 @@ fn rel_path_to_module_segments(rel_path: &Path) -> Vec<String> {
     // Add directory components
     if let Some(parent) = rel_path.parent() {
         for component in parent.components() {
-            if let std::path::Component::Normal(name) = component {
-                if let Some(s) = name.to_str() {
-                    segments.push(sanitize_filename(s).to_string());
-                }
+            if let std::path::Component::Normal(name) = component
+                && let Some(s) = name.to_str()
+            {
+                segments.push(sanitize_filename(s).to_string());
             }
         }
     }
