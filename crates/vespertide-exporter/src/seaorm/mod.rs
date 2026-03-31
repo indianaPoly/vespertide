@@ -1319,6 +1319,55 @@ fn to_snake_case(s: &str) -> String {
 }
 
 #[cfg(test)]
+mod module_path_tests {
+    use super::*;
+
+    #[test]
+    fn absolute_module_path_builds_correct_path() {
+        let result = absolute_module_path("crate::models", &["admin".into(), "admin".into()]);
+        assert_eq!(result, "crate::models::admin::admin");
+    }
+
+    #[test]
+    fn absolute_module_path_single_segment() {
+        let result = absolute_module_path("crate::models", &["user".into()]);
+        assert_eq!(result, "crate::models::user");
+    }
+
+    #[test]
+    fn absolute_module_path_deep_nesting() {
+        let result = absolute_module_path(
+            "crate::db::entities",
+            &["company".into(), "division".into(), "department".into()],
+        );
+        assert_eq!(result, "crate::db::entities::company::division::department");
+    }
+
+    #[test]
+    fn resolve_entity_module_path_with_crate_prefix() {
+        let mut module_paths = HashMap::new();
+        module_paths.insert("admin".into(), vec!["admin".into(), "admin".into()]);
+        let result = resolve_entity_module_path("admin", &module_paths, "crate::models");
+        assert_eq!(result, "crate::models::admin::admin");
+    }
+
+    #[test]
+    fn resolve_entity_module_path_fallback_when_no_mapping() {
+        let module_paths = HashMap::new();
+        let result = resolve_entity_module_path("user", &module_paths, "crate::models");
+        assert_eq!(result, "super::user");
+    }
+
+    #[test]
+    fn resolve_entity_module_path_fallback_when_empty_prefix() {
+        let mut module_paths = HashMap::new();
+        module_paths.insert("admin".into(), vec!["admin".into(), "admin".into()]);
+        let result = resolve_entity_module_path("admin", &module_paths, "");
+        assert_eq!(result, "super::admin");
+    }
+}
+
+#[cfg(test)]
 mod helper_tests {
     use super::*;
     use rstest::rstest;
